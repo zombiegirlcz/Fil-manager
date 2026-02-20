@@ -4,7 +4,7 @@ import shutil
 import asyncio
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.dimension import Dimension
@@ -87,18 +87,20 @@ class RenegadeFM_Ultimate:
             Window(height=1, content=FormattedTextControl(self.get_footer), style="class:footer"),
         ])
 
-        # Popup (Nápověda)
+        # Popup (Nápověda) - OPRAVA: Použití ConditionalContainer uvnitř Float
         self.root_container = FloatContainer(
             content=main_body,
             floats=[
                 Float(
-                    content=Dialog(
-                        title="NAPOVEDA",
-                        body=Label(self.get_help_text()),
-                        buttons=[Button("ZAVRIT", handler=self.toggle_help)],
-                        with_background=True
-                    ),
-                    visible=Condition(lambda: self.show_help)
+                    content=ConditionalContainer(
+                        content=Dialog(
+                            title="NAPOVEDA",
+                            body=Label(self.get_help_text()),
+                            buttons=[Button("ZAVRIT", handler=self.toggle_help)],
+                            with_background=True
+                        ),
+                        filter=Condition(lambda: self.show_help)
+                    )
                 )
             ]
         )
@@ -108,21 +110,20 @@ class RenegadeFM_Ultimate:
         self.kb = KeyBindings()
         self.setup_bindings()
         
-        # STYLY - TRANSPARENTNÍ MOD (bg:default)
+        # STYLY
         self.style = Style.from_dict({
-            'header': '#00ffff bold',       # Tyrkysová, bez pozadí
-            'footer': '#ffff00 bold',       # Žlutá, bez pozadí
-            'line':   '#888888',            # Šedé čáry
-            'dir':    '#00ff00 bold',       # Zelené složky
-            'file':   '#ffffff',            # Bílé soubory
-            'exec':   '#ff00ff bold',       # Fialové skripty
-            'selected': 'reverse',          # Inverzní barvy pro výběr
+            'header': '#00ffff bold',
+            'footer': '#ffff00 bold',
+            'line':   '#888888',
+            'dir':    '#00ff00 bold',
+            'file':   '#ffffff',
+            'exec':   '#ff00ff bold',
+            'selected': 'reverse',
             'copy-mark': '#ffff00 bold', 
             'move-mark': '#ff0000 bold',
             'preview-header': '#00ffff bold underline',
-            'terminal': '#aaaaaa',          # Šedý text terminálu, bez pozadí
+            'terminal': '#aaaaaa',
             'input': '#ffffff bold',
-            # Dialogy necháme s pozadím, aby byly čitelné nad textem
             'dialog': 'bg:#000088',
             'dialog.body': 'bg:#ffffff #000000',
             'button.focused': 'bg:#ff0000 #ffffff',
@@ -305,7 +306,6 @@ class RenegadeFM_Ultimate:
             else:
                 self.layout.focus(self.file_list_control)
         
-        # End ukonci aplikaci
         @kb.add('end')
         def _(event):
             event.app.exit()
@@ -473,10 +473,7 @@ class RenegadeFM_Ultimate:
                 with open(rc_path, "a") as rc:
                     rc.write(line)
                 self.log_to_terminal(f"Alias '{alias_name}' pridan do .bashrc\n")
-                
-                # Zkusíme provést source (pokus o načtení v běžícím shellu)
                 get_app().create_background_task(self.run_script_async(f"source {rc_path} && echo 'Konfigurace nactena'"))
-                
             except Exception as e:
                 self.log_to_terminal(f"Chyba zapisu aliasu: {e}\n")
 
