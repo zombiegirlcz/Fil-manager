@@ -42,7 +42,7 @@ Elegantní a intuitivní správce souborů pro terminál s moderním TUI rozhran
 ### Rychlá instalace
 ```bash
 # Klonuj repozitář
-git clone git@github.com:zombiegirlcz/Fil-manager.git
+git clone https://github.com/zombiegirlcz/Fil-manager.git
 cd Fil-manager
 
 # Spusť správce
