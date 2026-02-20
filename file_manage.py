@@ -1,451 +1,490 @@
-import curses
+#!/usr/bin/env python3
 import os
 import shutil
-import subprocess
-import sys
+import asyncio
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float
+from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
+from prompt_toolkit.layout.layout import Layout
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.application import run_in_terminal, get_app
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.widgets import Dialog, Label, Button, TextArea
 
-# Konfigurace barev a klaves
-KEY_ENTER = 10
-KEY_ESC = 27
-KEY_TAB = 9
-CTRL_E = 5
-CTRL_X = 24
-
-class RenegadeFM:
-    last_path = os.getcwd()  # Pamatuje si poslední cestu
-    
-    def __init__(self, stdscr):
-        self.stdscr = stdscr
-        self.current_path = os.getcwd()
+class RenegadeFM_Ultimate:
+    def __init__(self):
+        self.path = os.getcwd()
         self.files = []
         self.selected_index = 0
-        self.scroll_offset = 0
+        
+        # Schránka a akce
         self.clipboard = []
-        self.message = ""
-        self.command_buffer = ""
-        self.active_panel = "files"  # "files" nebo "command"
+        self.clipboard_action = 'copy'
         
-        # Nastaveni curses
-        curses.curs_set(0)
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)      # Slozky
-        curses.init_pair(2, curses.COLOR_WHITE, -1)      # Soubory
-        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Vyber
-        curses.init_pair(4, curses.COLOR_RED, -1)        # Schranka
-        curses.init_pair(5, curses.COLOR_YELLOW, -1)     # Zpravy
-        curses.init_pair(6, curses.COLOR_CYAN, -1)       # Info/highlight
-        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLACK)  # Command bar
-
+        self.message = "RenegadeFM (Transparent) - [Tab] CMD [Home] Domu [PgUp] Alias"
+        self.show_help = False
         self.refresh_files()
-        self.main_loop()
+        
+        # --- KOMPONENTY ---
+        
+        # 1. Příkazový řádek
+        self.command_input = TextArea(
+            height=1,
+            prompt='CMD > ',
+            style='class:input',
+            multiline=False,
+            accept_handler=self.accept_command
+        )
 
-    def refresh_files(self):
-        RenegadeFM.last_path = self.current_path  # Pamatuj si cestu
+        # 2. Spodní terminál (Log)
+        self.terminal_buffer = Buffer()
+        self.terminal_window = Window(
+            content=BufferControl(buffer=self.terminal_buffer),
+            wrap_lines=True,
+            style="class:terminal",
+            height=Dimension(min=5)
+        )
+        
+        # 3. Levý panel (Seznam)
+        self.file_list_control = FormattedTextControl(
+            self.get_file_content,
+            focusable=True,
+            show_cursor=False
+        )
+        self.file_window = Window(
+            content=self.file_list_control, 
+            wrap_lines=False, 
+            width=Dimension(weight=50)
+        )
+        
+        # 4. Pravý panel (Náhled)
+        self.preview_window = Window(
+            content=FormattedTextControl(self.get_preview_content), 
+            wrap_lines=True, 
+            width=Dimension(weight=50)
+        )
+
+        # --- LAYOUT ---
+        top_split = VSplit([
+            self.file_window,
+            Window(width=1, char='│', style="class:line"),
+            self.preview_window,
+        ])
+        
+        main_body = HSplit([
+            Window(height=1, content=FormattedTextControl(self.get_header), style="class:header"),
+            top_split,
+            Window(height=1, char='─', style="class:line"),
+            Window(height=1, content=FormattedTextControl(HTML(" <b>LOG / TERMINAL OUTPUT</b>")), style="class:header"),
+            self.terminal_window,
+            Window(height=1, char='─', style="class:line"),
+            self.command_input,
+            Window(height=1, content=FormattedTextControl(self.get_footer), style="class:footer"),
+        ])
+
+        # Popup (Nápověda)
+        self.root_container = FloatContainer(
+            content=main_body,
+            floats=[
+                Float(
+                    content=Dialog(
+                        title="NAPOVEDA",
+                        body=Label(self.get_help_text()),
+                        buttons=[Button("ZAVRIT", handler=self.toggle_help)],
+                        with_background=True
+                    ),
+                    visible=Condition(lambda: self.show_help)
+                )
+            ]
+        )
+        
+        self.layout = Layout(self.root_container)
+        
+        self.kb = KeyBindings()
+        self.setup_bindings()
+        
+        # STYLY - TRANSPARENTNÍ MOD (bg:default)
+        self.style = Style.from_dict({
+            'header': '#00ffff bold',       # Tyrkysová, bez pozadí
+            'footer': '#ffff00 bold',       # Žlutá, bez pozadí
+            'line':   '#888888',            # Šedé čáry
+            'dir':    '#00ff00 bold',       # Zelené složky
+            'file':   '#ffffff',            # Bílé soubory
+            'exec':   '#ff00ff bold',       # Fialové skripty
+            'selected': 'reverse',          # Inverzní barvy pro výběr
+            'copy-mark': '#ffff00 bold', 
+            'move-mark': '#ff0000 bold',
+            'preview-header': '#00ffff bold underline',
+            'terminal': '#aaaaaa',          # Šedý text terminálu, bez pozadí
+            'input': '#ffffff bold',
+            # Dialogy necháme s pozadím, aby byly čitelné nad textem
+            'dialog': 'bg:#000088',
+            'dialog.body': 'bg:#ffffff #000000',
+            'button.focused': 'bg:#ff0000 #ffffff',
+        })
+        
+        self.app = Application(
+            layout=self.layout,
+            key_bindings=self.kb,
+            style=self.style,
+            full_screen=True,
+            mouse_support=False
+        )
+        
+        self.layout.focus(self.file_list_control)
+
+    def accept_command(self, buff):
+        cmd = buff.text.strip()
+        if cmd:
+            get_app().create_background_task(self.run_script_async(cmd))
+        return True
+
+    def log_to_terminal(self, text):
+        new_text = self.terminal_buffer.text + text
+        self.terminal_buffer.set_document(Document(new_text, cursor_position=len(new_text)), bypass_readonly=True)
+
+    async def run_script_async(self, command):
+        self.log_to_terminal(f"\n[CMD]: {command}\n" + "-"*40 + "\n")
         try:
-            self.files = sorted(os.listdir(self.current_path))
-            self.files.insert(0, "..")
-        except PermissionError:
-            self.files = [".."]
-            self.message = "Pristup odepren!"
-        self.selected_index = 0
-        self.scroll_offset = 0
+            process = await asyncio.create_subprocess_exec(
+                "bash", "-c", command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT
+            )
+            while True:
+                line = await process.stdout.readline()
+                if not line: break
+                self.log_to_terminal(line.decode('utf-8', errors='replace'))
+                get_app().invalidate()
 
-    def draw_command_bar(self, max_y, max_x):
-        """Prikazovy radek na vrcholu"""
-        bar_height = 2
-        bar_win = curses.newwin(bar_height, max_x, 0, 0)
-        
-        if self.active_panel == "command":
-            bar_win.addstr(0, 0, " > ", curses.color_pair(6) | curses.A_BOLD)
-            bar_win.addstr(0, 3, self.command_buffer[:max_x-5], curses.color_pair(7))
-            curses.curs_set(1)
-        else:
-            bar_win.addstr(0, 0, " > ", curses.color_pair(6) | curses.A_BOLD)
-            bar_win.addstr(0, 3, self.command_buffer[:max_x-5], curses.color_pair(7))
-            curses.curs_set(0)
-        
-        # Info line
-        if self.active_panel == "command":
-            info = "[TAB] Zpet na soubory | [Enter] Spustit prikaz | [Esc] Zrusit"
-        else:
-            info = "[TAB] Prikazovy radek | [Arrows] Navigace | [q] Ukoncit"
-        
-        bar_win.addstr(1, 0, info[:max_x], curses.color_pair(6))
-        bar_win.clrtoeol()
-        bar_win.refresh()
-        
-        return bar_height
-
-    def draw_help_panel(self, max_y, max_x, left_width, top_offset):
-        """Nápověda na dolní pravé straně"""
-        help_h = max_y - top_offset - 3  # Prostor pro nápovědu
-        
-        if help_h < 5:
-            return
-        
-        help_win = curses.newwin(help_h, max_x - left_width, 
-                                 max_y - help_h + 2, left_width)
-        help_win.box()
-        help_win.addstr(0, 2, " NAPOVEDA ", curses.color_pair(6) | curses.A_BOLD)
-        
-        keys = [
-            ("↑/↓", "Navigace"),
-            ("Enter", "Otevrit"),
-            ("e", "Editovat (nano)"),
-            ("Ctrl+e", "Prejmenovat"),
-            ("r", "Smazat"),
-            ("m", "Nova slozka"),
-            ("n", "Novy soubor"),
-            ("x", "Vyjmout"),
-            ("Ctrl+x", "Vybrat vice"),
-            ("v", "Vlozit"),
-            ("Tab", "Prikazy"),
-            ("q", "Ukoncit"),
-        ]
-        
-        row = 1
-        for key, desc in keys:
-            if row < help_h - 1:
-                try:
-                    help_win.addstr(row, 2, f"{key:8} {desc}", curses.color_pair(2))
-                except:
-                    pass
-                row += 1
-        
-        # Stav schranky
-        if self.clipboard:
-            try:
-                help_win.addstr(help_h - 2, 2, f"Schranka: {len(self.clipboard)}", 
-                              curses.color_pair(4) | curses.A_BOLD)
-            except:
-                pass
-        
-        help_win.refresh()
-
-    def draw_files_panel(self, max_y, max_x, left_width, top_offset):
-        """Soubory na pravé straně"""
-        content_h = max_y - top_offset - 3
-        
-        if content_h < 2:
-            return
-        
-        files_win = curses.newwin(content_h, max_x - left_width,
-                                  top_offset, left_width)
-        files_win.box()
-        
-        # Titulka
-        title = f" {os.path.basename(self.current_path) or '/'} "
-        files_win.addstr(0, 2, title, curses.color_pair(6) | curses.A_BOLD)
-        
-        # Vypocet viditelne oblasti
-        display_h = content_h - 2
-        if self.selected_index >= self.scroll_offset + display_h:
-            self.scroll_offset = self.selected_index - display_h + 1
-        elif self.selected_index < self.scroll_offset:
-            self.scroll_offset = self.selected_index
-
-        for idx in range(display_h):
-            file_idx = idx + self.scroll_offset
-            if file_idx >= len(self.files):
-                break
-                
-            filename = self.files[file_idx]
-            full_path = os.path.join(self.current_path, filename)
-            
-            # Styl radku
-            style = curses.color_pair(2)
-            if os.path.isdir(full_path):
-                style = curses.color_pair(1) | curses.A_BOLD
-            
-            # Pokud je ve schrance
-            if full_path in self.clipboard:
-                style = curses.color_pair(4) | curses.A_DIM
-            
-            # Pokud je vybran kurzorem
-            if file_idx == self.selected_index:
-                style = curses.color_pair(3) | curses.A_BOLD
-
-            # Vykresleni
-            try:
-                display_name = filename
-                if filename == "..":
-                    display_name = ".. (Parent)"
-                elif os.path.isdir(full_path):
-                    display_name = f"[{filename}]"
-                
-                files_win.addstr(idx + 1, 2, display_name[:max_x - left_width - 5], style)
-            except curses.error:
-                pass
-
-        files_win.refresh()
-
-    def draw_left_panel(self, max_y, max_x, left_width, top_offset):
-        """Levá strana - budoucí rozšíření (zatím prázdná)"""
-        left_h = max_y - top_offset - 3
-        
-        if left_h < 2:
-            return
-        
-        left_win = curses.newwin(left_h, left_width,
-                                 top_offset, 0)
-        left_win.box()
-        left_win.addstr(0, 2, " INFO ", curses.color_pair(6) | curses.A_BOLD)
-        
-        # Cesta
-        try:
-            left_win.addstr(2, 2, "Cesta:", curses.A_BOLD)
-            left_win.addstr(3, 2, self.current_path[:left_width-4], curses.color_pair(2))
-        except:
-            pass
-        
-        # Info o souboru
-        if 0 <= self.selected_index < len(self.files):
-            target = self.files[self.selected_index]
-            if target != "..":
-                full_path = os.path.join(self.current_path, target)
-                try:
-                    left_win.addstr(5, 2, "Soubor:", curses.A_BOLD)
-                    left_win.addstr(6, 2, target[:left_width-4], curses.color_pair(2))
-                    
-                    if os.path.isfile(full_path):
-                        size = os.path.getsize(full_path)
-                        left_win.addstr(7, 2, f"Velikost: {size} B", curses.color_pair(6))
-                    elif os.path.isdir(full_path):
-                        items = len(os.listdir(full_path))
-                        left_win.addstr(7, 2, f"Polozek: {items}", curses.color_pair(6))
-                except:
-                    pass
-        
-        left_win.refresh()
-
-    def draw_message_bar(self, max_y, max_x):
-        """Zpravy na spodu"""
-        if self.message:
-            try:
-                self.stdscr.addstr(max_y - 1, 0, f" {self.message} ", 
-                                 curses.color_pair(5) | curses.A_BOLD)
-                self.stdscr.clrtoeol()
-            except:
-                pass
-
-    def draw_screen(self):
-        self.stdscr.clear()
-        max_y, max_x = self.stdscr.getmaxyx()
-        
-        # Prikazovy radek
-        top_offset = self.draw_command_bar(max_y, max_x)
-        
-        # Vypocet sirky levej stranky
-        left_width = int(max_x * 0.35)
-        
-        # Vykresli panely
-        self.draw_left_panel(max_y, max_x, left_width, top_offset)
-        self.draw_files_panel(max_y, max_x, left_width, top_offset)
-        self.draw_help_panel(max_y, max_x, left_width, top_offset)
-        
-        # Zpravy
-        self.draw_message_bar(max_y, max_x)
-        
-        self.stdscr.refresh()
-
-    def execute_command(self, command):
-        """Spustí příkaz z command baru"""
-        if not command.strip():
-            return
-        
-        try:
-            curses.endwin()
-            result = subprocess.run(command, shell=True, capture_output=False)
-            input("\nStiskni Enter pro navrat...")
-            curses.doupdate()
-            self.message = f"Prikaz proveden (exit: {result.returncode})"
+            await process.wait()
+            self.log_to_terminal(f"\n[EXIT] Code: {process.returncode}\n")
             self.refresh_files()
         except Exception as e:
-            self.message = f"Chyba: {str(e)}"
+            self.log_to_terminal(f"\n[ERR]: {str(e)}\n")
 
-    def prompt_user(self, prompt_text):
-        curses.echo()
-        curses.curs_set(1)
-        max_y, max_x = self.stdscr.getmaxyx()
-        self.stdscr.addstr(max_y - 1, 0, prompt_text)
-        self.stdscr.clrtoeol()
-        input_bytes = self.stdscr.getstr()
-        curses.noecho()
-        curses.curs_set(0)
-        return input_bytes.decode('utf-8')
+    def refresh_files(self):
+        try:
+            self.files = sorted(os.listdir(self.path))
+            self.files.insert(0, "..")
+        except:
+            self.files = [".."]
+        self.selected_index = 0
+
+    def get_header(self):
+        return HTML(f" <b>PATH:</b> {self.path} ")
+
+    def get_file_content(self):
+        lines = []
+        try: term_height = shutil.get_terminal_size().lines
+        except: term_height = 24
+        max_h = (term_height // 2) - 2
+        
+        start_idx = max(0, self.selected_index - max_h // 2)
+        end_idx = start_idx + max_h
+        visible_files = self.files[start_idx:end_idx]
+        
+        for i, filename in enumerate(visible_files):
+            real_idx = start_idx + i
+            full_path = os.path.join(self.path, filename)
+            
+            style_class = ""
+            display = filename
+            
+            if filename == "..":
+                display = "⬆ .. (Zpet)"
+                style_class = "class:dir"
+            elif os.path.isdir(full_path):
+                display = f"📁 {filename}"
+                style_class = "class:dir"
+            elif os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh')):
+                display = f"🚀 {filename}"
+                style_class = "class:exec"
+            else:
+                display = f"📄 {filename}"
+                style_class = "class:file"
+            
+            if full_path in self.clipboard:
+                if self.clipboard_action == 'move':
+                    style_class += " class:move-mark"
+                    display += " [CUT]"
+                else:
+                    style_class += " class:copy-mark"
+                    display += " [COPY]"
+
+            if real_idx == self.selected_index and self.layout.has_focus(self.file_list_control):
+                style_class = "class:selected " + style_class
+            
+            lines.append((style_class, f" {display} \n"))
+        return lines
+
+    def get_preview_content(self):
+        if not self.files: return []
+        filename = self.files[self.selected_index]
+        full_path = os.path.join(self.path, filename)
+        
+        lines = [("class:preview-header", f" {filename} \n"), ("", "\n")]
+        
+        if os.path.isdir(full_path):
+            try:
+                items = os.listdir(full_path)[:15]
+                lines.append(("", f" Slozka ({len(os.listdir(full_path))} polozek):\n"))
+                for item in items:
+                    lines.append(("", f"  - {item}\n"))
+            except: pass
+        elif os.path.isfile(full_path):
+            try:
+                sz = os.path.getsize(full_path)
+                lines.append(("", f" Velikost: {sz} B\n"))
+                if sz < 20000:
+                    lines.append(("", "-"*20 + "\n"))
+                    with open(full_path, 'r', errors='ignore') as f:
+                        lines.append(("class:terminal", f.read(800)))
+            except: pass
+        return lines
+
+    def get_footer(self):
+        mode = "COPY" if self.clipboard_action == 'copy' else "CUT/MOVE"
+        clip_info = f"{len(self.clipboard)} ({mode})" if self.clipboard else "0"
+        return HTML(f" <b>MSG:</b> {self.message} | <b>CLIP:</b> {clip_info} | <b>[PgUp]</b> Alias")
+
+    def get_help_text(self):
+        return """
+ ZKRATKY (v seznamu souboru)
+ ---------------------------
+ Home        : Domovska slozka (~)
+ End         : Ukoncit aplikaci
+ Tab         : Prikazovy radek
+ Enter       : Otevrit / Spustit
+ Sipka Vlevo : Zpet (..)
+ 
+ PgUp        : Vytvorit ALIAS (.bashrc)
+ 
+ r           : Smazat (Enter potvrdit)
+ c           : Kopirovat (Copy)
+ x           : Vyjmout (Cut)
+ v           : Vlozit (Paste)
+ n           : Novy soubor
+ m           : Nova slozka
+ 
+ Ctrl+e      : Prejmenovat
+ Ctrl+h      : Tato napoveda
+ q           : Konec
+        """
+
+    def toggle_help(self):
+        self.show_help = not self.show_help
+
+    def prompt_input(self, text, default=''):
+        res = None
+        def _ask():
+            nonlocal res
+            try:
+                print(f"\n{text}")
+                res = input(f"> {default}")
+            except: pass
+        run_in_terminal(_ask)
+        return res
+
+    def setup_bindings(self):
+        kb = self.kb
+
+        # --- GLOBALNI ---
+        @kb.add('c-h')
+        def _(event): self.toggle_help()
+
+        @kb.add('tab')
+        def _(event):
+            if self.layout.has_focus(self.file_list_control):
+                self.layout.focus(self.command_input)
+            else:
+                self.layout.focus(self.file_list_control)
+        
+        # End ukonci aplikaci
+        @kb.add('end')
+        def _(event):
+            event.app.exit()
+
+        @kb.add('c-c')
+        @kb.add('q')
+        def _(event):
+            if self.layout.has_focus(self.file_list_control) or event.key_sequence[0].key == 'c-c':
+                event.app.exit()
+
+        # --- FILE LIST ONLY ---
+        in_file_list = Condition(lambda: self.layout.has_focus(self.file_list_control))
+
+        @kb.add('up', filter=in_file_list)
+        def _(event): self.selected_index = max(0, self.selected_index - 1)
+
+        @kb.add('down', filter=in_file_list)
+        def _(event): self.selected_index = min(len(self.files) - 1, self.selected_index + 1)
+
+        @kb.add('pageup', filter=in_file_list)
+        def _(event): self.action_create_alias()
+
+        @kb.add('home', filter=in_file_list)
+        def _(event):
+            self.path = os.path.expanduser("~")
+            self.refresh_files()
+
+        @kb.add('left', filter=in_file_list)
+        def _(event):
+            self.path = os.path.dirname(self.path)
+            self.refresh_files()
+
+        @kb.add('right', filter=in_file_list)
+        @kb.add('enter', filter=in_file_list)
+        def _(event): self.action_enter()
+
+        @kb.add('c', filter=in_file_list)
+        def _(event): self.toggle_selection('copy')
+
+        @kb.add('x', filter=in_file_list)
+        def _(event): self.toggle_selection('move')
+
+        @kb.add('v', filter=in_file_list)
+        def _(event): self.action_paste()
+
+        @kb.add('r', filter=in_file_list)
+        def _(event): self.action_delete()
+            
+        @kb.add('c-e', filter=in_file_list)
+        def _(event): self.action_rename()
+
+        @kb.add('m', filter=in_file_list)
+        def _(event):
+            name = self.prompt_input("Nova slozka:")
+            if name:
+                try: os.mkdir(os.path.join(self.path, name)); self.refresh_files()
+                except Exception as e: self.log_to_terminal(str(e)+"\n")
+
+        @kb.add('n', filter=in_file_list)
+        def _(event):
+            name = self.prompt_input("Novy soubor:")
+            if name:
+                try: open(os.path.join(self.path, name), 'a').close(); self.refresh_files()
+                except Exception as e: self.log_to_terminal(str(e)+"\n")
+        
+        @kb.add('e', filter=in_file_list)
+        def _(event):
+            f = self.files[self.selected_index]
+            if f != "..":
+                run_in_terminal(lambda: os.system(f"nano '{os.path.join(self.path, f)}'"))
 
     def action_enter(self):
-        target = self.files[self.selected_index]
-        full_path = os.path.join(self.current_path, target)
+        filename = self.files[self.selected_index]
+        full_path = os.path.join(self.path, filename)
         
-        if target == "..":
-            self.current_path = os.path.dirname(self.current_path)
+        if filename == "..":
+            self.path = os.path.dirname(self.path)
             self.refresh_files()
         elif os.path.isdir(full_path):
-            self.current_path = full_path
+            self.path = full_path
             self.refresh_files()
-        elif os.access(full_path, os.X_OK):
-            curses.endwin()
-            os.system(f"'{full_path}'")
-            input("Stiskni Enter pro navrat...")
-            curses.doupdate()
+        elif os.path.isfile(full_path):
+            if os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh')):
+                cmd = f"python3 '{full_path}'" if filename.endswith('.py') else f"bash '{full_path}'"
+                get_app().create_background_task(self.run_script_async(cmd))
+            else:
+                run_in_terminal(lambda: os.system(f"nano '{full_path}'"))
+
+    def toggle_selection(self, mode):
+        f = self.files[self.selected_index]
+        if f == "..": return
+        if self.clipboard and self.clipboard_action != mode:
+            self.clipboard_action = mode
+        self.clipboard_action = mode
+        p = os.path.join(self.path, f)
+        if p in self.clipboard: self.clipboard.remove(p)
         else:
-            self.action_edit()
+            self.clipboard.append(p)
+            self.selected_index = min(len(self.files)-1, self.selected_index + 1)
 
-    def action_edit(self):
-        target = self.files[self.selected_index]
-        if target == "..": return
-        full_path = os.path.join(self.current_path, target)
-        curses.endwin()
-        os.system(f"nano '{full_path}'")
-
-    def action_rename(self):
-        target = self.files[self.selected_index]
-        if target == "..": return
-        new_name = self.prompt_user(f"Rename '{target}' to: ")
-        if new_name:
-            try:
-                os.rename(os.path.join(self.current_path, target), 
-                         os.path.join(self.current_path, new_name))
-                self.refresh_files()
-                self.message = f"Prejmenovno na '{new_name}'"
-            except Exception as e:
-                self.message = str(e)
-
-    def action_delete(self):
-        target = self.files[self.selected_index]
-        if target == "..": return
-        confirm = self.prompt_user(f"Smazat '{target}'? (y/n): ")
-        if confirm.lower() == 'y':
-            full_path = os.path.join(self.current_path, target)
-            try:
-                if os.path.isdir(full_path):
-                    shutil.rmtree(full_path)
-                else:
-                    os.remove(full_path)
-                self.refresh_files()
-                self.message = f"Smazano: {target}"
-            except Exception as e:
-                self.message = str(e)
-
-    def action_new_folder(self):
-        name = self.prompt_user("Nazev slozky: ")
-        if name:
-            try:
-                os.mkdir(os.path.join(self.current_path, name))
-                self.refresh_files()
-                self.message = f"Slozka vytvorena: {name}"
-            except Exception as e:
-                self.message = str(e)
-
-    def action_new_file(self):
-        name = self.prompt_user("Nazev souboru: ")
-        if name:
-            full_path = os.path.join(self.current_path, name)
-            try:
-                open(full_path, 'a').close()
-                curses.endwin()
-                os.system(f"nano '{full_path}'")
-                self.refresh_files()
-                self.message = f"Soubor vytvoreny: {name}"
-            except Exception as e:
-                self.message = str(e)
-
-    def action_cut(self, append=False):
-        target = self.files[self.selected_index]
-        if target == "..": return
-        full_path = os.path.join(self.current_path, target)
-        
-        if not append:
-            self.clipboard = []
-        
-        if full_path not in self.clipboard:
-            self.clipboard.append(full_path)
-            self.message = f"Vybrrano: {len(self.clipboard)} polozek"
-        else:
-            self.clipboard.remove(full_path)
-            self.message = f"Zruseno: {len(self.clipboard)} polozek zbyva"
-    
     def action_paste(self):
-        if not self.clipboard:
-            self.message = "Schranka je prazdna"
-            return
-            
-        success_count = 0
+        if not self.clipboard: return
+        count = 0
+        action = self.clipboard_action
         for src in self.clipboard:
             try:
-                if os.path.exists(src):
-                    dst = os.path.join(self.current_path, os.path.basename(src))
-                    shutil.move(src, dst)
-                    success_count += 1
-            except Exception as e:
-                self.message = f"Chyba: {str(e)}"
-        
+                dst = os.path.join(self.path, os.path.basename(src))
+                if action == 'move': shutil.move(src, dst)
+                else:
+                    if os.path.isdir(src): shutil.copytree(src, dst)
+                    else: shutil.copy2(src, dst)
+                count += 1
+            except Exception as e: self.log_to_terminal(f"Chyba {src}: {e}\n")
         self.clipboard = []
         self.refresh_files()
-        self.message = f"Presunuto {success_count} polozek"
+        self.log_to_terminal(f"Hotovo ({action} {count}).\n")
 
-    def main_loop(self):
-        while True:
-            self.draw_screen()
+    def action_delete(self):
+        f = self.files[self.selected_index]
+        if f == "..": return
+        res = self.prompt_input(f"Smazat '{f}'? (Enter = ANO)")
+        if res == "" or (res and res.lower() == 'y'):
+            try:
+                p = os.path.join(self.path, f)
+                if os.path.isdir(p): shutil.rmtree(p)
+                else: os.remove(p)
+                self.refresh_files()
+                self.log_to_terminal(f"Smazano: {f}\n")
+            except Exception as e:
+                self.log_to_terminal(f"Chyba: {e}\n")
+        else:
+            self.log_to_terminal("Mazani zruseno.\n")
 
-            key = self.stdscr.getch()
+    def action_rename(self):
+        f = self.files[self.selected_index]
+        if f == "..": return
+        new_name = self.prompt_input(f"Prejmenovat '{f}' na:", default=f)
+        if new_name and new_name != f:
+            try:
+                os.rename(os.path.join(self.path, f), os.path.join(self.path, new_name))
+                self.refresh_files()
+                self.log_to_terminal(f"Prejmenovano: {f} -> {new_name}\n")
+            except Exception as e:
+                self.log_to_terminal(f"Chyba: {e}\n")
 
-            if self.active_panel == "command":
-                # Prikazovy radek je aktivni
-                if key == KEY_TAB:
-                    self.active_panel = "files"
-                    self.command_buffer = ""
-                elif key == KEY_ESC:
-                    self.active_panel = "files"
-                    self.command_buffer = ""
-                    self.message = "Prikaz zrusen"
-                elif key == KEY_ENTER:
-                    self.active_panel = "files"
-                    self.execute_command(self.command_buffer)
-                    self.command_buffer = ""
-                elif key == curses.KEY_BACKSPACE or key == 127:
-                    self.command_buffer = self.command_buffer[:-1]
-                elif 32 <= key <= 126:  # Tisknutelne znaky
-                    self.command_buffer += chr(key)
-            else:
-                # Soubory jsou aktivni
-                if key == KEY_TAB:
-                    self.active_panel = "command"
-                    self.command_buffer = ""
-                elif key == curses.KEY_UP:
-                    if self.selected_index > 0:
-                        self.selected_index -= 1
-                elif key == curses.KEY_DOWN:
-                    if self.selected_index < len(self.files) - 1:
-                        self.selected_index += 1
-                elif key == KEY_ENTER:
-                    self.action_enter()
-                elif key == ord('e'):
-                    self.action_edit()
-                elif key == CTRL_E:
-                    self.action_rename()
-                elif key == ord('r'):
-                    self.action_delete()
-                elif key == ord('m'):
-                    self.action_new_folder()
-                elif key == ord('n'):
-                    self.action_new_file()
-                elif key == ord('x'):
-                    self.action_cut(append=False)
-                elif key == CTRL_X:
-                    self.action_cut(append=True)
-                elif key == ord('v'):
-                    self.action_paste()
-                elif key == ord('q'):
-                    break
-                elif key == ord('c'):
-                    # Clear message
-                    self.message = ""
+    def action_create_alias(self):
+        f = self.files[self.selected_index]
+        if f == "..": return
+        
+        full_path = os.path.join(self.path, f)
+        default_name = os.path.splitext(f)[0]
+        
+        alias_name = self.prompt_input(f"Vytvorit alias pro '{f}' jako:", default=default_name)
+        
+        if alias_name:
+            if f.endswith('.py'): cmd = f"python3 '{full_path}'"
+            elif f.endswith('.sh'): cmd = f"bash '{full_path}'"
+            elif f.endswith('.js'): cmd = f"node '{full_path}'"
+            else: cmd = f"'{full_path}'"
+            
+            line = f"\nalias {alias_name}=\"{cmd}\"\n"
+            rc_path = os.path.expanduser("~/.bashrc")
+            
+            try:
+                with open(rc_path, "a") as rc:
+                    rc.write(line)
+                self.log_to_terminal(f"Alias '{alias_name}' pridan do .bashrc\n")
+                
+                # Zkusíme provést source (pokus o načtení v běžícím shellu)
+                get_app().create_background_task(self.run_script_async(f"source {rc_path} && echo 'Konfigurace nactena'"))
+                
+            except Exception as e:
+                self.log_to_terminal(f"Chyba zapisu aliasu: {e}\n")
 
 if __name__ == "__main__":
     try:
-        curses.wrapper(RenegadeFM)
-    finally:
-        # Po ukonceni spravce zmeni shell do posledni otevrene slozky
-        os.chdir(RenegadeFM.last_path if hasattr(RenegadeFM, 'last_path') else os.getcwd())
+        fm = RenegadeFM_Ultimate()
+        fm.app.run()
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
