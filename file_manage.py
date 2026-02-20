@@ -278,19 +278,84 @@ class RenegadeFM_Ultimate:
  q           : Konec
         """
 
+    async def _show_input_dialog(self, title, label_text, default=""):
+        """
+        Asynchronně zobrazí dialog pro zadání textu a vrátí výsledek.
+        """
+        future = asyncio.Future()
+
+        def accept(buf):
+            self.root_container.floats.pop()
+            future.set_result(input_field.text)
+            self.layout.focus(self.file_list_control)
+
+        def cancel():
+            self.root_container.floats.pop()
+            future.set_result(None)
+            self.layout.focus(self.file_list_control)
+
+        input_field = TextArea(
+            text=default,
+            multiline=False,
+            password=False,
+            accept_handler=accept,
+        )
+
+        dialog = Dialog(
+            title=title,
+            body=HSplit([
+                Label(text=label_text),
+                input_field,
+            ]),
+            buttons=[
+                Button(text="OK", handler=lambda: accept(input_field.buffer)),
+                Button(text="Zrusit", handler=cancel),
+            ],
+            with_background=True,
+        )
+
+        self.root_container.floats.append(Float(content=dialog))
+        self.layout.focus(input_field)
+        get_app().invalidate()
+
+        return await future
+
+    async def _show_confirm_dialog(self, title, text):
+        """
+        Zobrazí potvrzovací dialog a vrátí True pokud uživatel stiskne OK.
+        """
+        future = asyncio.Future()
+
+        def accept():
+            self.root_container.floats.pop()
+            future.set_result(True)
+            self.layout.focus(self.file_list_control)
+
+        def cancel():
+            self.root_container.floats.pop()
+            future.set_result(False)
+            self.layout.focus(self.file_list_control)
+
+        dialog = Dialog(
+            title=title,
+            body=Label(text=text, dont_extend_height=True),
+            buttons=[
+                Button(text="Ano", handler=accept),
+                Button(text="Ne", handler=cancel),
+            ],
+            with_background=True,
+        )
+
+        self.root_container.floats.append(Float(content=dialog))
+        # Focus a button, e.g., the 'No' button by default
+        self.layout.focus(dialog.buttons[1])
+        get_app().invalidate()
+
+        return await future
+
     def toggle_help(self):
         self.show_help = not self.show_help
 
-    def prompt_input(self, text, default=''):
-        res = None
-        def _ask():
-            nonlocal res
-            try:
-                print(f"\n{text}")
-                res = input(f"> {default}")
-            except: pass
-        run_in_terminal(_ask)
-        return res
 
     def setup_bindings(self):
         kb = self.kb
@@ -326,7 +391,8 @@ class RenegadeFM_Ultimate:
         def _(event): self.selected_index = min(len(self.files) - 1, self.selected_index + 1)
 
         @kb.add('pageup', filter=in_file_list)
-        def _(event): self.action_create_alias()
+        def _(event):
+            asyncio.create_task(self.action_create_alias())
 
         @kb.add('home', filter=in_file_list)
         def _(event):
@@ -352,24 +418,34 @@ class RenegadeFM_Ultimate:
         def _(event): self.action_paste()
 
         @kb.add('r', filter=in_file_list)
-        def _(event): self.action_delete()
+        def _(event):
+            asyncio.create_task(self.action_delete())
             
         @kb.add('c-e', filter=in_file_list)
-        def _(event): self.action_rename()
+        def _(event):
+            asyncio.create_task(self.action_rename())
 
         @kb.add('m', filter=in_file_list)
-        def _(event):
-            name = self.prompt_input("Nova slozka:")
+        async def _(event):
+            name = await self._show_input_dialog("Nova slozka", "Zadejte nazev slozky:")
             if name:
-                try: os.mkdir(os.path.join(self.path, name)); self.refresh_files()
-                except Exception as e: self.log_to_terminal(str(e)+"\n")
+                try:
+                    os.mkdir(os.path.join(self.path, name))
+                    self.refresh_files()
+                    self.log_to_terminal(f"Slozka '{name}' vytvorena.\n")
+                except Exception as e:
+                    self.log_to_terminal(str(e)+"\n")
 
         @kb.add('n', filter=in_file_list)
-        def _(event):
-            name = self.prompt_input("Novy soubor:")
+        async def _(event):
+            name = await self._show_input_dialog("Novy soubor", "Zadejte nazev souboru:")
             if name:
-                try: open(os.path.join(self.path, name), 'a').close(); self.refresh_files()
-                except Exception as e: self.log_to_terminal(str(e)+"\n")
+                try:
+                    open(os.path.join(self.path, name), 'a').close()
+                    self.refresh_files()
+                    self.log_to_terminal(f"Soubor '{name}' vytvoren.\n")
+                except Exception as e:
+                    self.log_to_terminal(str(e)+"\n")
         
         @kb.add('e', filter=in_file_list)
         def _(event):
@@ -423,11 +499,16 @@ class RenegadeFM_Ultimate:
         self.refresh_files()
         self.log_to_terminal(f"Hotovo ({action} {count}).\n")
 
-    def action_delete(self):
+    async def action_delete(self):
         f = self.files[self.selected_index]
         if f == "..": return
-        res = self.prompt_input(f"Smazat '{f}'? (Enter = ANO)")
-        if res == "" or (res and res.lower() == 'y'):
+        
+        confirmed = await self._show_confirm_dialog(
+            title="Smazat",
+            text=f"Opravdu si prejete smazat '{f}'?"
+        )
+
+        if confirmed:
             try:
                 p = os.path.join(self.path, f)
                 if os.path.isdir(p): shutil.rmtree(p)
@@ -439,10 +520,16 @@ class RenegadeFM_Ultimate:
         else:
             self.log_to_terminal("Mazani zruseno.\n")
 
-    def action_rename(self):
+    async def action_rename(self):
         f = self.files[self.selected_index]
         if f == "..": return
-        new_name = self.prompt_input(f"Prejmenovat '{f}' na:", default=f)
+        
+        new_name = await self._show_input_dialog(
+            title="Prejmenovat",
+            label_text=f"Novy nazev pro '{f}':",
+            default=f
+        )
+
         if new_name and new_name != f:
             try:
                 os.rename(os.path.join(self.path, f), os.path.join(self.path, new_name))
@@ -451,14 +538,18 @@ class RenegadeFM_Ultimate:
             except Exception as e:
                 self.log_to_terminal(f"Chyba: {e}\n")
 
-    def action_create_alias(self):
+    async def action_create_alias(self):
         f = self.files[self.selected_index]
         if f == "..": return
         
         full_path = os.path.join(self.path, f)
         default_name = os.path.splitext(f)[0]
         
-        alias_name = self.prompt_input(f"Vytvorit alias pro '{f}' jako:", default=default_name)
+        alias_name = await self._show_input_dialog(
+            title="Vytvorit alias",
+            label_text=f"Zadejte nazev aliasu pro '{f}':",
+            default=default_name
+        )
         
         if alias_name:
             if f.endswith('.py'): cmd = f"python3 '{full_path}'"
