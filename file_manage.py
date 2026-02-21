@@ -34,8 +34,6 @@ class RenegadeFM_Ultimate:
         self.files = []
         self.selected_index = 0
         self.search_query = ""
-        self.search_buffer = Buffer()
-        self.search_buffer.on_text_changed += self._on_search_change
         
         # Schránka a akce
         self.clipboard = []
@@ -55,9 +53,10 @@ class RenegadeFM_Ultimate:
             style='class:input',
             multiline=False,
             wrap_lines=False,
-            buffer=self.search_buffer,
             accept_handler=self.handle_search_enter
         )
+        self.search_buffer = self.search_input.buffer
+        self.search_buffer.on_text_changed += self._on_search_change
 
         # 2. Spodní terminál (Log)
         self.terminal_buffer = Buffer()
