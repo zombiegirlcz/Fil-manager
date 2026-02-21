@@ -34,6 +34,7 @@ class RenegadeFM_Ultimate:
         self.files = []
         self.selected_index = 0
         self.search_query = ""
+        self.ignore_search_buffer_change = False
         
         # Schránka a akce
         self.clipboard = []
@@ -196,6 +197,8 @@ class RenegadeFM_Ultimate:
         self.apply_search_filter()
 
     def _on_search_change(self, buffer):
+        if self.ignore_search_buffer_change:
+            return
         self.search_query = buffer.text
         self.apply_search_filter()
 
@@ -224,12 +227,15 @@ class RenegadeFM_Ultimate:
             return True
 
         self.search_query = text
-        self.apply_search_filter()
+        self.apply_search_filter(select_first=True)
+        self._reset_search_buffer()
         self._focus_file_list()
         return True
 
     def _reset_search_buffer(self):
+        self.ignore_search_buffer_change = True
         self.search_buffer.document = Document("", 0)
+        self.ignore_search_buffer_change = False
 
     def _focus_file_list(self):
         try:
@@ -237,7 +243,7 @@ class RenegadeFM_Ultimate:
         except Exception:
             pass
 
-    def apply_search_filter(self):
+    def apply_search_filter(self, select_first=False):
         previous_selection = None
         if self.files and 0 <= self.selected_index < len(self.files):
             previous_selection = self.files[self.selected_index]
@@ -255,10 +261,14 @@ class RenegadeFM_Ultimate:
             filtered = [".."]
 
         self.files = filtered
-        if previous_selection in self.files:
-            self.selected_index = self.files.index(previous_selection)
+        if select_first:
+            first_match = next((idx for idx, name in enumerate(self.files) if name != ".."), 0)
+            self.selected_index = first_match
         else:
-            self.selected_index = 0
+            if previous_selection in self.files:
+                self.selected_index = self.files.index(previous_selection)
+            else:
+                self.selected_index = 0
 
         if self.selected_index >= len(self.files):
             self.selected_index = max(0, len(self.files) - 1)
