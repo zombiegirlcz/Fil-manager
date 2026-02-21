@@ -492,9 +492,15 @@ class RenegadeFM_Ultimate:
             event.app.exit()
 
         @kb.add('c-c')
+        def _(event):
+            if event.key_sequence[0].key == 'c-c':
+                self.log_to_terminal(f"\n[EXIT] Ukonceni pres Ctrl+C - {self.path}\n")
+                event.app.exit()
+
         @kb.add('q')
         def _(event):
-            if self.layout.has_focus(self.file_list_control) or event.key_sequence[0].key == 'c-c':
+            if self.layout.has_focus(self.file_list_control):
+                self.log_to_terminal(f"\n[EXIT] Ukonceni - otevreny adresar: {self.path}\n")
                 event.app.exit()
 
         # --- FILE LIST ONLY ---
