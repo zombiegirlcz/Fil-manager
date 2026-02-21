@@ -2,6 +2,7 @@
 import os
 import shutil
 import asyncio
+import shlex
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer
@@ -13,32 +14,49 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.application import run_in_terminal, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.widgets import Dialog, Label, Button, TextArea
 
 class RenegadeFM_Ultimate:
+    SCRIPT_COMMAND_MAP = {
+        '.py': 'python3',
+        '.sh': 'bash',
+        '.js': 'node',
+        '.rb': 'ruby',
+        '.pl': 'perl',
+        '.php': 'php',
+        '.jar': 'java -jar',
+    }
+
     def __init__(self):
         self.path = os.getcwd()
+        self.all_files = []
         self.files = []
         self.selected_index = 0
+        self.search_query = ""
+        self.search_buffer = Buffer()
+        self.search_buffer.on_text_changed += self._on_search_change
         
         # Schránka a akce
         self.clipboard = []
         self.clipboard_action = 'copy'
         
-        self.message = "RenegadeFM (Transparent) - [Tab] CMD [Home] Domu [PgUp] Alias"
+        self.message = "RenegadeFM (Transparent) - [Tab] Hledat [Home] Domu [PgUp] Alias"
         self.show_help = False
+        self.active_dialog = None  # hlídá aktivní dialog (confirm/input), aby neprobublávaly zkratky
         self.refresh_files()
         
         # --- KOMPONENTY ---
         
-        # 1. Příkazový řádek
-        self.command_input = TextArea(
+        # 1. Vyhledávací řádek
+        self.search_input = TextArea(
             height=1,
-            prompt='CMD > ',
+            prompt='Hledat > ',
             style='class:input',
             multiline=False,
-            accept_handler=self.accept_command
+            wrap_lines=False,
+            buffer=self.search_buffer,
+            accept_handler=self.handle_search_enter
         )
 
         # 2. Spodní terminál (Log)
@@ -83,7 +101,7 @@ class RenegadeFM_Ultimate:
             Window(height=1, content=FormattedTextControl(HTML(" <b>LOG / TERMINAL OUTPUT</b>")), style="class:header"),
             self.terminal_window,
             Window(height=1, char='─', style="class:line"),
-            self.command_input,
+            self.search_input,
             Window(height=1, content=FormattedTextControl(self.get_footer), style="class:footer"),
         ])
 
@@ -171,11 +189,78 @@ class RenegadeFM_Ultimate:
 
     def refresh_files(self):
         try:
-            self.files = sorted(os.listdir(self.path))
-            self.files.insert(0, "..")
+            entries = sorted(os.listdir(self.path))
+            entries.insert(0, "..")
         except:
-            self.files = [".."]
-        self.selected_index = 0
+            entries = [".."]
+        self.all_files = entries
+        self.apply_search_filter()
+
+    def _on_search_change(self, event):
+        self.search_query = event.buffer.text
+        self.apply_search_filter()
+
+    def handle_search_enter(self, buff):
+        text = buff.text.strip()
+        if not text:
+            return True
+
+        if text.startswith("$$"):
+            cmd = text[2:].strip()
+            if cmd:
+                self.log_to_terminal(f"[CMD] Spoustim v nove session: {cmd}\n")
+                run_in_terminal(lambda: os.system(f"bash -lc {shlex.quote(cmd)}"))
+            self._reset_search_buffer()
+            return True
+
+        if text.startswith("$"):
+            cmd = text[1:].strip()
+            if cmd:
+                self.log_to_terminal(f"[CMD] Spoustim: {cmd}\n")
+                get_app().create_background_task(self.run_script_async(cmd))
+            self._reset_search_buffer()
+            return True
+
+        self.search_query = text
+        self.apply_search_filter()
+        return True
+
+    def _reset_search_buffer(self):
+        self.search_buffer.document = Document("", 0)
+
+    def apply_search_filter(self):
+        previous_selection = None
+        if self.files and 0 <= self.selected_index < len(self.files):
+            previous_selection = self.files[self.selected_index]
+
+        query = self.search_query.strip()
+        if query.startswith("$"):
+            filtered = list(self.all_files)
+        elif query:
+            normalized = query.lower()
+            filtered = [f for f in self.all_files if f == ".." or normalized in f.lower()]
+        else:
+            filtered = list(self.all_files)
+
+        if not filtered:
+            filtered = [".."]
+
+        self.files = filtered
+        if previous_selection in self.files:
+            self.selected_index = self.files.index(previous_selection)
+        else:
+            self.selected_index = 0
+
+        if self.selected_index >= len(self.files):
+            self.selected_index = max(0, len(self.files) - 1)
+
+        self._invalidate_ui()
+
+    def _invalidate_ui(self):
+        try:
+            get_app().invalidate()
+        except Exception:
+            pass
 
     def get_header(self):
         return HTML(f" <b>PATH:</b> {self.path} ")
@@ -203,7 +288,7 @@ class RenegadeFM_Ultimate:
             elif os.path.isdir(full_path):
                 display = f"📁 {filename}"
                 style_class = "class:dir"
-            elif os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh')):
+            elif os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh','js')):
                 display = f"🚀 {filename}"
                 style_class = "class:exec"
             else:
@@ -252,7 +337,8 @@ class RenegadeFM_Ultimate:
     def get_footer(self):
         mode = "COPY" if self.clipboard_action == 'copy' else "CUT/MOVE"
         clip_info = f"{len(self.clipboard)} ({mode})" if self.clipboard else "0"
-        return HTML(f" <b>MSG:</b> {self.message} | <b>CLIP:</b> {clip_info} | <b>[PgUp]</b> Alias")
+        search_state = self.search_query or "-"
+        return HTML(f" <b>MSG:</b> {self.message} | <b>CLIP:</b> {clip_info} | <b>Hledat:</b> {search_state} | <b>[PgUp]</b> Alias")
 
     def get_help_text(self):
         return """
@@ -260,9 +346,10 @@ class RenegadeFM_Ultimate:
  ---------------------------
  Home        : Domovska slozka (~)
  End         : Ukoncit aplikaci
- Tab         : Prikazovy radek
- Enter       : Otevrit / Spustit
+ Tab         : Fokus na vyhledavani
+ Enter       : Otevrit slozku / spustit skript / rozbalit archiv
  Sipka Vlevo : Zpet (..)
+ Hledat >    : Filtruje soubory podle zadaneho textu
  
  PgUp        : Vytvorit ALIAS (.bashrc)
  
@@ -274,7 +361,7 @@ class RenegadeFM_Ultimate:
  m           : Nova slozka
  
  Ctrl+e      : Prejmenovat
- Ctrl+h      : Tato napoveda
+ F1 / ?      : Tato napoveda
  q           : Konec
         """
 
@@ -284,15 +371,17 @@ class RenegadeFM_Ultimate:
         """
         future = asyncio.Future()
 
-        def accept(buf):
+        def accept(buf=None):
             self.root_container.floats.pop()
             future.set_result(input_field.text)
             self.layout.focus(self.file_list_control)
+            self.active_dialog = None
 
         def cancel():
             self.root_container.floats.pop()
             future.set_result(None)
             self.layout.focus(self.file_list_control)
+            self.active_dialog = None
 
         input_field = TextArea(
             text=default,
@@ -314,6 +403,7 @@ class RenegadeFM_Ultimate:
             with_background=True,
         )
 
+        self.active_dialog = {"type": "input"}
         self.root_container.floats.append(Float(content=dialog))
         self.layout.focus(input_field)
         get_app().invalidate()
@@ -330,25 +420,28 @@ class RenegadeFM_Ultimate:
             self.root_container.floats.pop()
             future.set_result(True)
             self.layout.focus(self.file_list_control)
+            self.active_dialog = None
 
         def cancel():
             self.root_container.floats.pop()
             future.set_result(False)
             self.layout.focus(self.file_list_control)
+            self.active_dialog = None
+
+        btn_yes = Button(text="Ano", handler=accept)
+        btn_no = Button(text="Ne", handler=cancel)
 
         dialog = Dialog(
             title=title,
-            body=Label(text=text, dont_extend_height=True),
-            buttons=[
-                Button(text="Ano", handler=accept),
-                Button(text="Ne", handler=cancel),
-            ],
+            body=Label(text=text),
+            buttons=[btn_yes, btn_no],
             with_background=True,
         )
 
+        self.active_dialog = {"type": "confirm"}
         self.root_container.floats.append(Float(content=dialog))
-        # Focus a button, e.g., the 'No' button by default
-        self.layout.focus(dialog.buttons[1])
+        # Focus default: Ne
+        self.layout.focus(btn_no)
         get_app().invalidate()
 
         return await future
@@ -361,13 +454,14 @@ class RenegadeFM_Ultimate:
         kb = self.kb
 
         # --- GLOBALNI ---
-        @kb.add('c-h')
+        @kb.add('f1', filter=Condition(lambda: self.layout.has_focus(self.file_list_control)))
+        @kb.add('?', filter=Condition(lambda: self.layout.has_focus(self.file_list_control)))
         def _(event): self.toggle_help()
 
         @kb.add('tab')
         def _(event):
             if self.layout.has_focus(self.file_list_control):
-                self.layout.focus(self.command_input)
+                self.layout.focus(self.search_input)
             else:
                 self.layout.focus(self.file_list_control)
         
@@ -454,6 +548,8 @@ class RenegadeFM_Ultimate:
                 run_in_terminal(lambda: os.system(f"nano '{os.path.join(self.path, f)}'"))
 
     def action_enter(self):
+        if not self.files:
+            return
         filename = self.files[self.selected_index]
         full_path = os.path.join(self.path, filename)
         
@@ -464,11 +560,45 @@ class RenegadeFM_Ultimate:
             self.path = full_path
             self.refresh_files()
         elif os.path.isfile(full_path):
-            if os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh')):
-                cmd = f"python3 '{full_path}'" if filename.endswith('.py') else f"bash '{full_path}'"
-                get_app().create_background_task(self.run_script_async(cmd))
-            else:
-                run_in_terminal(lambda: os.system(f"nano '{full_path}'"))
+            archive_cmd = self._build_archive_command(filename, full_path)
+            if archive_cmd:
+                self.log_to_terminal(f"[ARCHIVE] Rozbaluji '{filename}'\n")
+                get_app().create_background_task(self.run_script_async(archive_cmd))
+                return
+
+            script_cmd = self._build_script_command(filename, full_path)
+            if script_cmd:
+                get_app().create_background_task(self.run_script_async(script_cmd))
+                return
+
+            if os.access(full_path, os.X_OK):
+                get_app().create_background_task(self.run_script_async(shlex.quote(full_path)))
+                return
+
+            run_in_terminal(lambda: os.system(f"nano '{full_path}'"))
+
+    def _build_archive_command(self, filename, full_path):
+        lower = filename.lower()
+        quote_path = shlex.quote(full_path)
+        quote_dir = shlex.quote(self.path)
+        if lower.endswith(('.tar.gz', '.tgz')):
+            return f"tar -xzf {quote_path} -C {quote_dir}"
+        if lower.endswith('.tar.bz2'):
+            return f"tar -xjf {quote_path} -C {quote_dir}"
+        if lower.endswith(('.tar.xz', '.txz')):
+            return f"tar -xJf {quote_path} -C {quote_dir}"
+        if lower.endswith('.tar'):
+            return f"tar -xf {quote_path} -C {quote_dir}"
+        if lower.endswith('.zip'):
+            return f"unzip -o {quote_path} -d {quote_dir}"
+        return None
+
+    def _build_script_command(self, filename, full_path):
+        ext = os.path.splitext(filename)[1].lower()
+        cmd = self.SCRIPT_COMMAND_MAP.get(ext)
+        if cmd:
+            return f"{cmd} {shlex.quote(full_path)}"
+        return None
 
     def toggle_selection(self, mode):
         f = self.files[self.selected_index]
