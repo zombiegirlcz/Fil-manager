@@ -106,6 +106,23 @@ Potřebuješ rychle nainstalovat balíček? Nemusíš ukončovat správce.
 - **Nefungují barvy?** Ujisti se, že tvůj terminál podporuje 256 barev (Termux to umí defaultně).
 - **Chyba `cbreak`?** Tato verze (Ultimate) nepoužívá `curses`, takže by se tato chyba neměla nikdy objevit.
 
+## 🔁 Zachování aktuálního adresáře (Termux)
+
+Aby po ukončení správce zůstalo aktuální pracovní adresář v původním shellu, přidej do svého `~/.bashrc` (nebo `~/.zshrc`) jednoduchou funkci:
+
+```bash
+fm() {
+  python3 ~/Fil-manager/file_manage.py
+  local last_path
+  last_path=$(cat ~/.renegadefm_last_path 2>/dev/null)
+  if [[ -n $last_path && -d $last_path ]]; then
+    cd "$last_path"
+  fi
+}
+```
+
+Po spuštění `source ~/.bashrc` a použití `fm` se po ukončení správce vrátíš zpět do složky, ve které jsi naposledy pracoval. Pokud potřebuješ spustit renagent, stačí napsat `fm`.
+
 ---
 
 **Autor:** zombiegirlcz  
