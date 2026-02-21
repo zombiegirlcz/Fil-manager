@@ -474,13 +474,13 @@ class RenegadeFM_Ultimate:
 
         # --- GLOBALNI ---
         panel_focus = Condition(lambda: self.layout.has_focus(self.file_list_control))
-        panel_or_search = Condition(lambda: self.layout.has_focus(self.file_list_control) or self.layout.has_focus(self.search_input))
+        allow_focus_toggle = Condition(lambda: self.active_dialog is None)
         @kb.add('f1', filter=panel_focus)
         @kb.add('?', filter=panel_focus)
-        @kb.add('c-h', filter=panel_or_search)
+        @kb.add('c-h', filter=panel_focus)
         def _(event): self.toggle_help()
 
-        @kb.add('tab')
+        @kb.add('tab', filter=allow_focus_toggle)
         def _(event):
             if self.layout.has_focus(self.file_list_control):
                 self.layout.focus(self.search_input)
