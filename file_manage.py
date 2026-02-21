@@ -202,6 +202,7 @@ class RenegadeFM_Ultimate:
     def handle_search_enter(self, buff):
         text = buff.text.strip()
         if not text:
+            self._focus_file_list()
             return True
 
         if text.startswith("$$"):
@@ -210,6 +211,7 @@ class RenegadeFM_Ultimate:
                 self.log_to_terminal(f"[CMD] Spoustim v nove session: {cmd}\n")
                 run_in_terminal(lambda: os.system(f"bash -lc {shlex.quote(cmd)}"))
             self._reset_search_buffer()
+            self._focus_file_list()
             return True
 
         if text.startswith("$"):
@@ -218,14 +220,22 @@ class RenegadeFM_Ultimate:
                 self.log_to_terminal(f"[CMD] Spoustim: {cmd}\n")
                 get_app().create_background_task(self.run_script_async(cmd))
             self._reset_search_buffer()
+            self._focus_file_list()
             return True
 
         self.search_query = text
         self.apply_search_filter()
+        self._focus_file_list()
         return True
 
     def _reset_search_buffer(self):
         self.search_buffer.document = Document("", 0)
+
+    def _focus_file_list(self):
+        try:
+            self.layout.focus(self.file_list_control)
+        except Exception:
+            pass
 
     def apply_search_filter(self):
         previous_selection = None
@@ -453,8 +463,11 @@ class RenegadeFM_Ultimate:
         kb = self.kb
 
         # --- GLOBALNI ---
-        @kb.add('f1', filter=Condition(lambda: self.layout.has_focus(self.file_list_control)))
-        @kb.add('?', filter=Condition(lambda: self.layout.has_focus(self.file_list_control)))
+        panel_focus = Condition(lambda: self.layout.has_focus(self.file_list_control))
+        panel_or_search = Condition(lambda: self.layout.has_focus(self.file_list_control) or self.layout.has_focus(self.search_input))
+        @kb.add('f1', filter=panel_focus)
+        @kb.add('?', filter=panel_focus)
+        @kb.add('c-h', filter=panel_or_search)
         def _(event): self.toggle_help()
 
         @kb.add('tab')
