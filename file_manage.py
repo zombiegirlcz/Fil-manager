@@ -195,8 +195,8 @@ class RenegadeFM_Ultimate:
         self.all_files = entries
         self.apply_search_filter()
 
-    def _on_search_change(self, event):
-        self.search_query = event.buffer.text
+    def _on_search_change(self, buffer):
+        self.search_query = buffer.text
         self.apply_search_filter()
 
     def handle_search_enter(self, buff):
