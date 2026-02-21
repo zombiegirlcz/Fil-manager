@@ -27,9 +27,10 @@ class RenegadeFM_Ultimate:
         '.php': 'php',
         '.jar': 'java -jar',
     }
+    LAST_PATH_FILE = os.path.expanduser("~/.renegadefm_last_path")
 
     def __init__(self):
-        self.path = os.getcwd()
+        self.path = self._load_last_path() or os.getcwd()
         self.all_files = []
         self.files = []
         self.selected_index = 0
@@ -281,6 +282,27 @@ class RenegadeFM_Ultimate:
         except Exception:
             pass
 
+    def _load_last_path(self):
+        try:
+            if os.path.isfile(self.LAST_PATH_FILE):
+                with open(self.LAST_PATH_FILE, 'r') as f:
+                    path = f.read().strip()
+                    if path and os.path.isdir(path):
+                        return path
+        except Exception:
+            pass
+        return None
+
+    def _save_last_path(self):
+        try:
+            dirpath = os.path.dirname(self.LAST_PATH_FILE)
+            if dirpath and not os.path.isdir(dirpath):
+                os.makedirs(dirpath, exist_ok=True)
+            with open(self.LAST_PATH_FILE, 'w') as f:
+                f.write(self.path)
+        except Exception as e:
+            self.log_to_terminal(f"[SAVE PATH ERR] {e}\n")
+
     def get_header(self):
         return HTML(f" <b>PATH:</b> {self.path} ")
 
@@ -489,17 +511,20 @@ class RenegadeFM_Ultimate:
         
         @kb.add('end')
         def _(event):
+            self._save_last_path()
             event.app.exit()
 
         @kb.add('c-c')
         def _(event):
             if event.key_sequence[0].key == 'c-c':
+                self._save_last_path()
                 self.log_to_terminal(f"\n[EXIT] Ukonceni pres Ctrl+C - {self.path}\n")
                 event.app.exit()
 
         @kb.add('q')
         def _(event):
             if self.layout.has_focus(self.file_list_control):
+                self._save_last_path()
                 self.log_to_terminal(f"\n[EXIT] Ukonceni - otevreny adresar: {self.path}\n")
                 event.app.exit()
 
