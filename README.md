@@ -67,7 +67,8 @@
 
 2. **Nainstaluj závislosti:**
    ```bash
-   pip install prompt_toolkit
+   bash install.sh
+   # nebo: pip install -r requirements.txt
    ```
 
 3. **Spusť:**
