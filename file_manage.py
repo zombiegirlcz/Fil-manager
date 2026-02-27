@@ -15,7 +15,7 @@ from prompt_toolkit.application import run_in_terminal, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.widgets import Dialog, Label, Button, TextArea
+from prompt_toolkit.widgets import Dialog, Label, Button, TextArea, RadioList
 
 class RenegadeFM_Ultimate:
     SCRIPT_COMMAND_MAP = {
@@ -174,7 +174,8 @@ class RenegadeFM_Ultimate:
             process = await asyncio.create_subprocess_exec(
                 "bash", "-c", command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self.path
             )
             while True:
                 line = await process.stdout.readline()
@@ -188,6 +189,29 @@ class RenegadeFM_Ultimate:
         except Exception as e:
             self.log_to_terminal(f"\n[ERR]: {str(e)}\n")
 
+    async def run_command_with_output(self, command):
+        self.log_to_terminal(f"\n[CMD]: {command}\n" + "-"*40 + "\n")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "bash", "-c", command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.path
+            )
+            stdout, stderr = await process.communicate()
+            
+            if stdout:
+                self.log_to_terminal(stdout.decode('utf-8', errors='replace'))
+            if stderr:
+                self.log_to_terminal(stderr.decode('utf-8', errors='replace'))
+
+            self.log_to_terminal(f"\n[EXIT] Code: {process.returncode}\n")
+            self.refresh_files()
+
+            return stdout.decode('utf-8', errors='replace').strip(), stderr.decode('utf-8', errors='replace').strip(), process.returncode
+        except Exception as e:
+            self.log_to_terminal(f"\n[ERR]: {str(e)}\n")
+            return "", str(e), 1
     def refresh_files(self):
         try:
             entries = sorted(os.listdir(self.path))
@@ -236,6 +260,7 @@ class RenegadeFM_Ultimate:
     def _reset_search_buffer(self):
         self.ignore_search_buffer_change = True
         self.search_buffer.document = Document("", 0)
+        self.search_query = ""
         self.ignore_search_buffer_change = False
 
     def _focus_file_list(self):
@@ -388,7 +413,7 @@ class RenegadeFM_Ultimate:
  Home        : Domovska slozka (~)
  End         : Ukoncit aplikaci
  Tab         : Fokus na vyhledavani
- Enter       : Otevrit slozku / spustit skript / rozbalit archiv
+ Enter       : Otevrit/spustit (v plovoucim okne, pokud je skript)
  Sipka Vlevo : Zpet (..)
  Hledat >    : Filtruje soubory podle zadaneho textu
  
@@ -402,6 +427,7 @@ class RenegadeFM_Ultimate:
  m           : Nova slozka
  
  Ctrl+e      : Prejmenovat
+ Alt+G       : Git Push Dialog
  F1 / ?      : Tato napoveda
  q           : Konec
         """
@@ -483,6 +509,45 @@ class RenegadeFM_Ultimate:
         self.root_container.floats.append(Float(content=dialog))
         # Focus default: Ne
         self.layout.focus(btn_no)
+        get_app().invalidate()
+
+        return await future
+
+    async def _show_radiolist_dialog(self, title, text, values):
+        """
+        Zobrazí dialog s výběrem a vrátí vybranou hodnotu.
+        """
+        future = asyncio.Future()
+
+        def accept():
+            self.root_container.floats.pop()
+            future.set_result(radio_list.current_value)
+            self.layout.focus(self.file_list_control)
+            self.active_dialog = None
+
+        def cancel():
+            self.root_container.floats.pop()
+            future.set_result(None)
+            self.layout.focus(self.file_list_control)
+            self.active_dialog = None
+
+        radio_list = RadioList(values)
+        dialog = Dialog(
+            title=title,
+            body=HSplit([
+                Label(text=text),
+                radio_list,
+            ]),
+            buttons=[
+                Button(text="OK", handler=accept),
+                Button(text="Zrusit", handler=cancel),
+            ],
+            with_background=True,
+        )
+
+        self.active_dialog = {"type": "input"}
+        self.root_container.floats.append(Float(content=dialog))
+        self.layout.focus(radio_list)
         get_app().invalidate()
 
         return await future
@@ -572,6 +637,10 @@ class RenegadeFM_Ultimate:
         def _(event):
             asyncio.create_task(self.action_rename())
 
+        @kb.add('escape', 'g', filter=in_file_list)
+        def _(event):
+            asyncio.create_task(self.action_git_push_dialog())
+
         @kb.add('m', filter=in_file_list)
         async def _(event):
             name = await self._show_input_dialog("Nova slozka", "Zadejte nazev slozky:")
@@ -606,6 +675,8 @@ class RenegadeFM_Ultimate:
         filename = self.files[self.selected_index]
         full_path = os.path.join(self.path, filename)
         
+        self._reset_search_buffer()
+
         if filename == "..":
             self.path = os.path.dirname(self.path)
             self.refresh_files()
@@ -620,15 +691,104 @@ class RenegadeFM_Ultimate:
                 return
 
             script_cmd = self._build_script_command(filename, full_path)
+            if not script_cmd and os.access(full_path, os.X_OK):
+                script_cmd = shlex.quote(full_path)
+
             if script_cmd:
-                get_app().create_background_task(self.run_script_async(script_cmd))
+                float_cmd = f"am start -n com.termux.window/.TermuxFloatActivity -e com.termux.execute \"{script_cmd}\""
+                run_in_terminal(lambda: os.system(float_cmd))
+                self.log_to_terminal(f"[INFO] Spoustim '{filename}' v plovoucim okne...\n")
                 return
-
-            if os.access(full_path, os.X_OK):
-                get_app().create_background_task(self.run_script_async(shlex.quote(full_path)))
-                return
-
+                
             run_in_terminal(lambda: os.system(f"nano '{full_path}'"))
+
+    async def action_git_push_dialog(self):
+        # Step 1: Check for .git directory
+        stdout, stderr, returncode = await self.run_command_with_output("git rev-parse --is-inside-work-tree")
+        
+        is_git_repo = returncode == 0 and stdout.strip() == "true"
+
+        if not is_git_repo:
+            confirmed = await self._show_confirm_dialog(
+                title="Git Repozitar",
+                text="Toto neni Git repozitar. Chcete jej inicializovat?"
+            )
+            if confirmed:
+                await self.run_script_async("git init")
+            else:
+                self.log_to_terminal("Operace Git Push zrusena.\n")
+                return
+        
+        # Step 2: Check for remote
+        remote_url, _, returncode = await self.run_command_with_output("git remote get-url origin")
+        if returncode != 0:
+            remote_url_input = await self._show_input_dialog(
+                title="Vzdaleny repozitar",
+                label_text="Zadejte URL pro 'origin':"
+            )
+            if remote_url_input:
+                await self.run_script_async(f"git remote add origin {shlex.quote(remote_url_input)}")
+            else:
+                self.log_to_terminal("Operace Git Push zrusena.\n")
+                return
+        
+        # Step 3: Get Branch
+        current_branch, _, _ = await self.run_command_with_output("git branch --show-current")
+        branch_choices = [("main", "main"), ("master", "master")]
+        if current_branch and (current_branch, current_branch) not in branch_choices:
+            branch_choices.insert(0, (current_branch, current_branch))
+        
+        branch_choices.append(("custom", "Vlastni..."))
+
+        branch = await self._show_radiolist_dialog(
+            title="Vyberte vetev",
+            text="Do ktere vetve chcete pushovat?",
+            values=branch_choices
+        )
+
+        if not branch:
+            self.log_to_terminal("Operace Git Push zrusena.\n")
+            return
+        
+        if branch == "custom":
+            branch = await self._show_input_dialog(
+                title="Vlastni vetev",
+                label_text="Zadejte nazev vetve:"
+            )
+            if not branch:
+                self.log_to_terminal("Operace Git Push zrusena.\n")
+                return
+
+        # Step 4: Commit changes
+        status_output, _, _ = await self.run_command_with_output("git status --porcelain")
+        if status_output:
+            commit_confirmed = await self._show_confirm_dialog(
+                title="Commit",
+                text="Mate necommitnute zmeny. Chcete je pridat a commitnout?"
+            )
+            if commit_confirmed:
+                commit_message = await self._show_input_dialog(
+                    title="Commit zprava",
+                    label_text="Zadejte zpravu pro commit:"
+                )
+                if commit_message:
+                    await self.run_script_async("git add .")
+                    await self.run_script_async(f"git commit -m {shlex.quote(commit_message)}")
+                else:
+                    self.log_to_terminal("Operace Git Push zrusena - prazdna commit zprava.\n")
+                    return
+            else:
+                self.log_to_terminal("Push pokracuje bez commitu...\n")
+
+        # Step 5: Push
+        push_confirmed = await self._show_confirm_dialog(
+            title="Git Push",
+            text=f"Opravdu chcete pushovat do 'origin/{branch}'?"
+        )
+        if push_confirmed:
+            await self.run_script_async(f"git push origin {shlex.quote(branch)}")
+        else:
+            self.log_to_terminal("Operace Git Push zrusena.\n")
 
     def _build_archive_command(self, filename, full_path):
         lower = filename.lower()
