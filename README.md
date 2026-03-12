@@ -18,6 +18,7 @@
 
 ### 🚀 Funkce
 - **Multi-Select**: Označ více souborů pro kopírování (`c`) nebo přesun (`x`).
+- **ZIP Archivace**: Označ soubory klávesou `z` a sbal je do zipu klávesou `Ctrl+z`.
 - **Rychlé Aliasy**: Stiskni `PgUp` na souboru a okamžitě vytvoř alias do `.bashrc`!
 - **Integrovaný CMD**: Přepni se `Tab` do příkazové řádky a spouštěj `git`, `pkg`, `pip` příkazy přímo ze správce.
 - **Spouštění skriptů**: Stačí `Enter` na `.py` nebo `.sh` souboru – spustí se asynchronně na pozadí a výstup vidíš dole.
@@ -43,7 +44,10 @@
 | `c` | **Kopírovat** (přidat do výběru) |
 | `x` | **Vyjmout** (přidat do výběru) |
 | `v` | **Vložit** (provést akci) |
-| `r` | **Smazat** (potvrzení Enterem) |
+| `z` | **Označit k zabalení** (přidat do ZIP výběru) |
+| `Ctrl+z` | **Zabalit do ZIP** (vytvoří archiv ze označených souborů) |
+| `Ctrl+r` | **Označit k smazání** |
+| `r` | **Smazat** (potvrzení dialogem) |
 | `Ctrl+e` | **Přejmenovat** |
 | `n` | Nový soubor |
 | `m` | Nová složka |
