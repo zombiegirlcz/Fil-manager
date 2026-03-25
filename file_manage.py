@@ -74,6 +74,7 @@ class RenegadeFM_Ultimate:
         self.clipboard_action = 'copy'
         
         self.message = "RenegadeFM - [Tab]Hledat [F2]Nastaveni [Ctrl+R]Mark [Ctrl+Q]Exit"
+        self.supermod_active = False
         self.show_help = False
         self.active_dialog = None
         self.refresh_files()
@@ -186,6 +187,7 @@ class RenegadeFM_Ultimate:
             'dialog': 'bg:#000088',
             'dialog.body': 'bg:#ffffff #000000',
             'button.focused': 'bg:#ff0000 #ffffff',
+            'ansired': '#ff0000 bold',
         })
         
         self.app = Application(
@@ -250,10 +252,52 @@ class RenegadeFM_Ultimate:
         try:
             entries = sorted(os.listdir(self.path))
             entries.insert(0, "..")
-        except:
+        except PermissionError:
+            if not self.supermod_active:
+                self.supermod_active = True
+                self.log_to_terminal(f"[⚡ SUPERMOD] Permission denied → SuperMod aktivován pro {self.path}\n")
+            entries = [".."] + self._supermod_scan()
+        except Exception:
             entries = [".."]
         self.all_files = entries
         self.apply_search_filter()
+
+    def _supermod_scan(self):
+        """Best-effort listing: scandir + pm list packages fallback."""
+        import subprocess
+        path = self.path
+        results = []
+
+        # Try scandir — may yield partial results before failing
+        try:
+            for entry in os.scandir(path):
+                results.append(entry.name)
+            return sorted(results)
+        except PermissionError:
+            pass
+
+        # For /data/data specifically: use pm list packages
+        if path.rstrip('/') in ('/data/data', '/data'):
+            pkg_set = set()
+            # Our own package is always accessible
+            prefix = os.environ.get('PREFIX', '')
+            if prefix:
+                parts = prefix.split('/')
+                if len(parts) > 3:
+                    pkg_set.add(parts[3])  # e.g. com.termux
+            try:
+                r = subprocess.run(
+                    ['pm', 'list', 'packages'],
+                    capture_output=True, text=True, timeout=5
+                )
+                for line in r.stdout.splitlines():
+                    if line.startswith('package:'):
+                        pkg_set.add(line[8:].strip())
+            except Exception:
+                pass
+            return sorted(pkg_set)
+
+        return results
 
     def _on_search_change(self, buffer):
         if self.ignore_search_buffer_change:
@@ -380,6 +424,8 @@ class RenegadeFM_Ultimate:
             self.log_to_terminal(f"[SAVE PATH ERR] {e}\n")
 
     def get_header(self):
+        if self.supermod_active:
+            return HTML(f" <b>⚡ SUPERMOD</b> <ansired>{self.path}</ansired> | [i]→Home  [I]→Internal  [S] Deactivate")
         return HTML(f" <b>PATH:</b> {self.path} | <b>DEL:</b> {len(self.delete_marks)} | <b>ZIP:</b> {len(self.zip_marks)}")
 
     def get_file_content(self):
@@ -408,10 +454,11 @@ class RenegadeFM_Ultimate:
                 display = "⬆ .. (Zpět)"
                 style_class = "class:dir"
             elif os.path.isdir(full_path):
-                display = f"📁 {filename}"
+                accessible = os.access(full_path, os.R_OK)
+                display = f"📁 {filename}" if accessible else f"🔒 {filename}"
                 color_name = ext_colors.get("directory", "green")
                 color = self.COLOR_PRESETS.get(color_name, "#00ff00")
-                style_class = f"fg:{color}"
+                style_class = f"fg:{color}" if accessible else "fg:#ff6600"
             elif os.access(full_path, os.X_OK) or filename.endswith(('.py', '.sh','js')):
                 display = f"🚀 {filename}"
                 _, ext = os.path.splitext(filename)
@@ -481,6 +528,8 @@ class RenegadeFM_Ultimate:
         return lines
 
     def get_footer(self):
+        if self.supermod_active:
+            return HTML(" <b>⚡ SUPERMOD</b> | <ansired>i</ansired>=→Home  <ansired>I</ansired>=→Internal  <ansired>S</ansired>=Deactivate  | 🔒=nedostupné")
         mode = "COPY" if self.clipboard_action == 'copy' else "CUT/MOVE"
         clip_info = f"{len(self.clipboard)} ({mode})" if self.clipboard else "0"
         marked = f"{len(self.delete_marks)} k mazání" if self.delete_marks else "0"
@@ -509,7 +558,14 @@ class RenegadeFM_Ultimate:
  m           : Nová složka
  e           : Editovat (nano)
  Ctrl+e      : Přejmenovat
- 
+
+ ⚡ SUPERMOD
+ -----------
+ S           : Zapnout/vypnout SuperMod (/data/data/)
+ i           : [SuperMod] Kopírovat → ~/Home
+ I           : [SuperMod] Kopírovat → ~/storage/shared/
+ 🔒          : Složka/soubor bez přístupu
+
  F1 / ?      : Tato nápověda
  q           : Konec
         """
@@ -842,6 +898,28 @@ class RenegadeFM_Ultimate:
             if f != "..":
                 run_in_terminal(lambda: os.system(f"nano '{os.path.join(self.path, f)}'"))
 
+        @kb.add('s', filter=in_file_list)
+        def _(event):
+            if self.supermod_active:
+                self.supermod_active = False
+                self.path = os.path.expanduser("~")
+                self.log_to_terminal("[⚡ SUPERMOD] Deaktivován\n")
+            else:
+                self.supermod_active = True
+                self.path = "/data/data"
+                self.log_to_terminal("[⚡ SUPERMOD] Aktivován — /data/data/\n")
+            self.refresh_files()
+
+        @kb.add('i', filter=in_file_list)
+        def _(event):
+            if self.supermod_active:
+                asyncio.create_task(self.supermod_copy_to_home())
+
+        @kb.add('I', filter=in_file_list)
+        def _(event):
+            if self.supermod_active:
+                asyncio.create_task(self.supermod_copy_to_internal())
+
         @kb.add('z', filter=in_file_list)
         def _(event):
             self.toggle_zip_mark()
@@ -954,7 +1032,13 @@ class RenegadeFM_Ultimate:
             self.path = os.path.dirname(self.path)
             self.refresh_files()
         elif os.path.isdir(full_path):
-            self.path = full_path
+            try:
+                os.listdir(full_path)  # Test access
+                self.path = full_path
+            except PermissionError:
+                self.supermod_active = True
+                self.path = full_path
+                self.log_to_terminal(f"[⚡ SUPERMOD] Auto-aktivován pro {full_path}\n")
             self.refresh_files()
         elif os.path.isfile(full_path):
             script_cmd = self._build_script_command(filename, full_path)
@@ -1071,6 +1155,41 @@ class RenegadeFM_Ultimate:
                 get_app().create_background_task(self.run_script_async(f"source {rc_path} && echo 'Konfigurace načtena'"))
             except Exception as e:
                 self.log_to_terminal(f"Chyba zápisu aliasu: {e}\n")
+
+    async def supermod_copy_to_home(self):
+        if not self.files:
+            return
+        f = self.files[self.selected_index]
+        if f == "..":
+            return
+        src = os.path.join(self.path, f)
+        dst = os.path.join(os.path.expanduser("~"), os.path.basename(src))
+        try:
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            self.log_to_terminal(f"[⚡ SUPERMOD] Zkopírováno → ~/: {f}\n")
+        except Exception as e:
+            self.log_to_terminal(f"[⚡ SUPERMOD] Chyba kopírování: {e}\n")
+
+    async def supermod_copy_to_internal(self):
+        if not self.files:
+            return
+        f = self.files[self.selected_index]
+        if f == "..":
+            return
+        src = os.path.join(self.path, f)
+        internal = os.path.expanduser("~/storage/shared/")
+        dst = os.path.join(internal, os.path.basename(src))
+        try:
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            self.log_to_terminal(f"[⚡ SUPERMOD] Zkopírováno → Internal: {f}\n")
+        except Exception as e:
+            self.log_to_terminal(f"[⚡ SUPERMOD] Chyba kopírování: {e}\n")
 
 if __name__ == "__main__":
     try:
