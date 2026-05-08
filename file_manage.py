@@ -4,7 +4,12 @@ import shutil
 import asyncio
 import shlex
 import json
-import zipfile
+import tarfile
+import subprocess
+import pty
+import fcntl
+import termios
+import struct
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer
@@ -12,12 +17,19 @@ from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import HTML, ANSI, to_formatted_text
 from prompt_toolkit.application import run_in_terminal, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.widgets import Dialog, Label, Button, TextArea, RadioList
+from prompt_toolkit.lexers import Lexer
+
+class AnsiLexer(Lexer):
+    def lex_document(self, document):
+        def get_line(lineno):
+            return to_formatted_text(ANSI(document.lines[lineno]))
+        return get_line
 
 class RenegadeFM_Ultimate:
     SCRIPT_COMMAND_MAP = {
@@ -52,6 +64,41 @@ class RenegadeFM_Ultimate:
             ".sh": "magenta", 
             ".txt": "white",
             ".md": "green",
+            ".json": "yellow",
+            ".jsonl": "yellow",
+            ".yml": "yellow",
+            ".yaml": "yellow",
+            ".toml": "yellow",
+            ".xml": "yellow",
+            ".conf": "white",
+            ".log": "gray",
+            ".tar": "red",
+            ".gz": "red",
+            ".zip": "red",
+            ".rar": "red",
+            ".7z": "red",
+            ".c": "cyan",
+            ".cpp": "cyan",
+            ".h": "cyan",
+            ".hpp": "cyan",
+            ".rs": "red",
+            ".go": "cyan",
+            ".java": "red",
+            ".kt": "magenta",
+            ".sql": "yellow",
+            ".db": "yellow",
+            ".sqlite": "yellow",
+            ".jpg": "cyan",
+            ".png": "cyan",
+            ".gif": "cyan",
+            ".svg": "cyan",
+            ".mp3": "blue",
+            ".mp4": "blue",
+            ".pdf": "white",
+            ".html": "green",
+            ".css": "blue",
+            ".js": "yellow",
+            ".ts": "blue",
             "directory": "green",
             "executable": "magenta",
             "default": "white",
@@ -69,12 +116,13 @@ class RenegadeFM_Ultimate:
         self.search_query = ""
         self.ignore_search_buffer_change = False
         self.delete_marks = set()
-        self.zip_marks = set()
+        self.tar_marks = set()
         self.clipboard = []
         self.clipboard_action = 'copy'
         
         self.message = "RenegadeFM - [Tab]Hledat [F2]Nastaveni [Ctrl+R]Mark [Ctrl+Q]Exit"
         self.supermod_active = False
+        self.terminal_fullscreen = False
         self.show_help = False
         self.active_dialog = None
         self.refresh_files()
@@ -91,10 +139,15 @@ class RenegadeFM_Ultimate:
         self.search_buffer = self.search_input.buffer
         self.search_buffer.on_text_changed += self._on_search_change
 
-        # Log
+        # Log / Terminal
         self.terminal_buffer = Buffer()
+        self.terminal_control = BufferControl(
+            buffer=self.terminal_buffer,
+            lexer=AnsiLexer(),
+            focusable=True
+        )
         self.terminal_window = Window(
-            content=BufferControl(buffer=self.terminal_buffer),
+            content=self.terminal_control,
             wrap_lines=True,
             style="class:terminal",
             height=Dimension(min=5)
@@ -126,26 +179,33 @@ class RenegadeFM_Ultimate:
             self.preview_window,
         ])
         
-        self.body_components = [
+        # Definice kontejnerů s filtry pro přepínání
+        self.manager_view = HSplit([
             Window(height=1, content=FormattedTextControl(self.get_header), style="class:header"),
             top_split,
             Window(height=1, char='─', style="class:line"),
-        ]
-        
-        # Log se přidá pokud je povoleno
-        if self.settings["show_log"]:
-            self.body_components.extend([
-                Window(height=1, content=FormattedTextControl(HTML(" <b>LOG / TERMINAL OUTPUT</b>")), style="class:header"),
-                self.terminal_window,
-                Window(height=1, char='─', style="class:line"),
-            ])
-        
-        self.body_components.extend([
+            ConditionalContainer(
+                content=HSplit([
+                    Window(height=1, content=FormattedTextControl(HTML(" <b>REAL TERMINAL SESSION</b>")), style="class:header"),
+                    self.terminal_window,
+                    Window(height=1, char='─', style="class:line"),
+                ]),
+                filter=Condition(lambda: self.settings["show_log"])
+            ),
             self.search_input,
             Window(height=1, content=FormattedTextControl(self.get_footer), style="class:footer"),
         ])
-        
-        main_body = HSplit(self.body_components)
+
+        self.fullscreen_terminal_view = HSplit([
+            Window(height=1, content=FormattedTextControl(HTML(" <b>TERMINAL FULLSCREEN (Ctrl+T pro návrat)</b>")), style="class:header"),
+            self.terminal_window,
+        ])
+
+        # Hlavní tělo aplikace přepíná mezi manažerem a full-screen terminálem
+        main_body = HSplit([
+            ConditionalContainer(content=self.manager_view, filter=Condition(lambda: not self.terminal_fullscreen)),
+            ConditionalContainer(content=self.fullscreen_terminal_view, filter=Condition(lambda: self.terminal_fullscreen)),
+        ])
 
         self.root_container = FloatContainer(
             content=main_body,
@@ -168,6 +228,7 @@ class RenegadeFM_Ultimate:
         
         self.kb = KeyBindings()
         self.setup_bindings()
+        self.setup_terminal() # Spuštění terminálu
         
         self.style = Style.from_dict({
             'header': '#00ffff bold',
@@ -180,7 +241,7 @@ class RenegadeFM_Ultimate:
             'copy-mark': '#ffff00 bold', 
             'move-mark': '#ff0000 bold',
             'delete-mark': '#ff6600 bold',
-            'zip-mark': '#0088ff bold',
+            'tar-mark': '#0088ff bold',
             'preview-header': '#00ffff bold underline',
             'terminal': '#aaaaaa',
             'input': '#ffffff bold',
@@ -220,11 +281,71 @@ class RenegadeFM_Ultimate:
         except Exception as e:
             self.log_to_terminal(f"Chyba ukládání nastavení: {e}\n")
 
+    def setup_terminal(self):
+        # Spuštění persistentní bash relace přes PTY
+        try:
+            self.master_fd, self.slave_fd = pty.openpty()
+            self.terminal_proc = subprocess.Popen(
+                ["bash"],
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                cwd=self.path,
+                env=os.environ.copy()
+            )
+            # Nastavení master_fd na neblokující čtení
+            flags = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            
+            # Přidání čtečky do asyncio loopu
+            loop = asyncio.get_event_loop()
+            loop.add_reader(self.master_fd, self._on_terminal_output)
+            
+            # Prvotní synchronizace cesty
+            self.sync_terminal_path()
+        except Exception as e:
+            self.log_to_terminal(f"Chyba inicializace terminálu: {e}\n")
+
+    def _on_terminal_output(self):
+        try:
+            data = os.read(self.master_fd, 8192).decode('utf-8', 'replace')
+            if data:
+                current_text = self.terminal_buffer.text
+                new_text = current_text + data
+                # Limitujeme velikost bufferu na 50000 znaků
+                if len(new_text) > 50000:
+                    new_text = new_text[-50000:]
+                
+                # Aktualizace bufferu (bypass_readonly=True umožní zápis i když je fokusovaný)
+                self.terminal_buffer.set_document(Document(new_text, cursor_position=len(new_text)), bypass_readonly=True)
+                get_app().invalidate()
+        except Exception:
+            pass
+
+    def send_to_terminal(self, text):
+        try:
+            os.write(self.master_fd, text.encode())
+        except Exception as e:
+            self.log_to_terminal(f"Chyba zápisu do terminálu: {e}\n")
+
+    def sync_terminal_path(self):
+        # Synchronizace CWD terminálu s manažerem
+        # Mezera před 'cd' zabrání uložení do historie v mnoha shell konfiguracích
+        cmd = f" cd {shlex.quote(self.path)}\n"
+        self.send_to_terminal(cmd)
+
     def log_to_terminal(self, text):
         if not self.settings["show_log"]:
             return
-        new_text = self.terminal_buffer.text + text
+        # Logujeme přímo do bufferu terminálu s ANSI barvou pro odlišení (žlutá)
+        fm_text = f"\x1b[33m[FM]: {text}\x1b[0m"
+        if not fm_text.endswith('\n'):
+            fm_text += '\n'
+        
+        current_text = self.terminal_buffer.text
+        new_text = current_text + fm_text
         self.terminal_buffer.set_document(Document(new_text, cursor_position=len(new_text)), bypass_readonly=True)
+        get_app().invalidate()
 
     async def run_script_async(self, command):
         self.log_to_terminal(f"\n[CMD]: {command}\n" + "-"*40 + "\n")
@@ -259,6 +380,11 @@ class RenegadeFM_Ultimate:
             entries = [".."] + self._supermod_scan()
         except Exception:
             entries = [".."]
+        
+        # Synchronizace terminálu při každém osvěžení souborů (včetně změny cesty)
+        if hasattr(self, 'master_fd'):
+            self.sync_terminal_path()
+            
         self.all_files = entries
         self.apply_search_filter()
 
@@ -426,7 +552,7 @@ class RenegadeFM_Ultimate:
     def get_header(self):
         if self.supermod_active:
             return HTML(f" <b>⚡ SUPERMOD</b> <ansired>{self.path}</ansired> | [i]→Home  [I]→Internal  [S] Deactivate")
-        return HTML(f" <b>PATH:</b> {self.path} | <b>DEL:</b> {len(self.delete_marks)} | <b>ZIP:</b> {len(self.zip_marks)}")
+        return HTML(f" <b>PATH:</b> {self.path} | <b>DEL:</b> {len(self.delete_marks)} | <b>TAR:</b> {len(self.tar_marks)}")
 
     def get_file_content(self):
         lines = []
@@ -476,6 +602,9 @@ class RenegadeFM_Ultimate:
                 if self.clipboard_action == 'move':
                     style_class += " class:move-mark"
                     display += " [CUT]"
+                elif self.clipboard_action == 'symlink':
+                    style_class += " fg:#00ffff bold"
+                    display += " [LINK]"
                 else:
                     style_class += " class:copy-mark"
                     display += " [COPY]"
@@ -484,9 +613,9 @@ class RenegadeFM_Ultimate:
                 style_class += " class:delete-mark"
                 display += " [DEL]"
             
-            if full_path in self.zip_marks:
-                style_class += " class:zip-mark"
-                display += " [ZIP]"
+            if full_path in self.tar_marks:
+                style_class += " class:tar-mark"
+                display += " [TAR]"
 
             if real_idx == self.selected_index and self.layout.has_focus(self.file_list_control):
                 style_class = "class:selected " + style_class
@@ -530,7 +659,9 @@ class RenegadeFM_Ultimate:
     def get_footer(self):
         if self.supermod_active:
             return HTML(" <b>⚡ SUPERMOD</b> | <ansired>i</ansired>=→Home  <ansired>I</ansired>=→Internal  <ansired>S</ansired>=Deactivate  | 🔒=nedostupné")
-        mode = "COPY" if self.clipboard_action == 'copy' else "CUT/MOVE"
+        
+        mode_map = {'copy': 'COPY', 'move': 'CUT/MOVE', 'symlink': 'SYMLINK'}
+        mode = mode_map.get(self.clipboard_action, "NONE")
         clip_info = f"{len(self.clipboard)} ({mode})" if self.clipboard else "0"
         marked = f"{len(self.delete_marks)} k mazání" if self.delete_marks else "0"
         return HTML(f" <b>CLIP:</b> {clip_info} | <b>MARKED:</b> {marked} | Preview: {'ON' if self.settings['large_preview'] else 'OFF'}")
@@ -541,23 +672,35 @@ class RenegadeFM_Ultimate:
  -------
  Home        : Domovská složka
  End / Ctrl+Q: Ukončit aplikaci
- Tab         : Fokus na vyhledávání
+ Tab         : Přepnout fokus (Soubory -> Hledat -> Terminál)
+ Ctrl+T      : Full-screen Terminál (ZAP/VYP)
  Enter       : Otevřít/spustit
  Šipka vlevo : Zpět (..)
  
- PgUp        : Vytvořit ALIAS
+ PgUp        : Označit pro SYMLINK
  F2          : Nastavení
  
  Ctrl+R      : Přepnout označení ke smazání
  r           : Smazat (s potvrzením)
  c           : Kopírovat
  x           : Vyjmout
- v           : Vložit
+ v           : Vložit (Kopie/Přesun/Symlink)
+ Ctrl+v      : Vložit Symlink s novým názvem
+ 
+ z           : Označit k archivaci (TAR)
+ Ctrl+z      : Vytvořit TAR archiv (TAR, GZ, BZ2)
  
  n           : Nový soubor
  m           : Nová složka
  e           : Editovat (nano)
  Ctrl+e      : Přejmenovat
+
+ TERMINÁL
+ --------
+ - Spodní okno je nyní reálná bash relace.
+ - Fokus se přepíná klávesou Tab.
+ - Terminál automaticky následuje složku v manažeru.
+ - Výstupy operací (mazání, kopírování) se zobrazují zde.
 
  ⚡ SUPERMOD
  -----------
@@ -688,15 +831,42 @@ class RenegadeFM_Ultimate:
 
         def apply_settings():
             self.root_container.floats.pop()
-            self.settings["large_preview"] = large_preview_radio.current_value == "true"
-            self.settings["show_log"] = show_log_radio.current_value == "true"
-            self.settings["script_command_mode"] = cmd_mode_radio.current_value
             
+            # Programování
             self.settings["extension_colors"][".py"] = py_color_radio.current_value
             self.settings["extension_colors"][".sh"] = sh_color_radio.current_value
+            self.settings["extension_colors"][".js"] = js_color_radio.current_value
+            self.settings["extension_colors"][".rs"] = rs_color_radio.current_value
+            self.settings["extension_colors"][".cpp"] = cpp_color_radio.current_value
+            self.settings["extension_colors"][".c"] = cpp_color_radio.current_value
+            self.settings["extension_colors"][".h"] = cpp_color_radio.current_value
+            
+            # Config / DB
+            self.settings["extension_colors"][".json"] = json_color_radio.current_value
+            self.settings["extension_colors"][".jsonl"] = json_color_radio.current_value
+            self.settings["extension_colors"][".yml"] = yaml_color_radio.current_value
+            self.settings["extension_colors"][".yaml"] = yaml_color_radio.current_value
+            self.settings["extension_colors"][".sql"] = sql_color_radio.current_value
+            self.settings["extension_colors"][".db"] = sql_color_radio.current_value
+            
+            # Text / Web
             self.settings["extension_colors"][".txt"] = txt_color_radio.current_value
             self.settings["extension_colors"][".md"] = md_color_radio.current_value
+            self.settings["extension_colors"][".html"] = html_color_radio.current_value
+            self.settings["extension_colors"][".log"] = log_color_radio.current_value
+            
+            # Média / Systém
             self.settings["extension_colors"]["directory"] = dir_color_radio.current_value
+            
+            # Sjednocené Archivy
+            arc_color = tar_color_radio.current_value
+            for ext in [".tar", ".gz", ".zip", ".rar", ".7z"]:
+                self.settings["extension_colors"][ext] = arc_color
+                
+            # Obrázky
+            img_color = img_color_radio.current_value
+            for ext in [".jpg", ".png", ".gif", ".svg"]:
+                self.settings["extension_colors"][ext] = img_color
             
             self._save_settings()
             future.set_result(True)
@@ -710,52 +880,69 @@ class RenegadeFM_Ultimate:
             self.layout.focus(self.file_list_control)
             self.active_dialog = None
 
-        large_preview_radio = RadioList([("true", "Velký náhled (vypne log)"), ("false", "Běžný náhled")])
-        large_preview_radio.current_value = "true" if self.settings["large_preview"] else "false"
-
-        show_log_radio = RadioList([("true", "Zobrazit log"), ("false", "Skrýt log")])
-        show_log_radio.current_value = "true" if self.settings["show_log"] else "false"
-
-        cmd_mode_radio = RadioList([("tmux", "$$ = Tmux"), ("termux_float", "$ = Termux Float")])
-        cmd_mode_radio.current_value = self.settings["script_command_mode"]
-
         color_choices = [(k, k.upper()) for k in self.COLOR_PRESETS.keys()]
 
-        py_color_radio = RadioList(color_choices)
-        py_color_radio.current_value = self.settings["extension_colors"].get(".py", "magenta")
+        # Barevné RadioListy
+        py_color_radio = RadioList(color_choices); py_color_radio.current_value = self.settings["extension_colors"].get(".py", "magenta")
+        sh_color_radio = RadioList(color_choices); sh_color_radio.current_value = self.settings["extension_colors"].get(".sh", "magenta")
+        js_color_radio = RadioList(color_choices); js_color_radio.current_value = self.settings["extension_colors"].get(".js", "yellow")
+        rs_color_radio = RadioList(color_choices); rs_color_radio.current_value = self.settings["extension_colors"].get(".rs", "red")
+        cpp_color_radio = RadioList(color_choices); cpp_color_radio.current_value = self.settings["extension_colors"].get(".cpp", "cyan")
+        
+        json_color_radio = RadioList(color_choices); json_color_radio.current_value = self.settings["extension_colors"].get(".json", "yellow")
+        yaml_color_radio = RadioList(color_choices); yaml_color_radio.current_value = self.settings["extension_colors"].get(".yml", "yellow")
+        sql_color_radio = RadioList(color_choices); sql_color_radio.current_value = self.settings["extension_colors"].get(".sql", "yellow")
+        
+        txt_color_radio = RadioList(color_choices); txt_color_radio.current_value = self.settings["extension_colors"].get(".txt", "white")
+        md_color_radio = RadioList(color_choices); md_color_radio.current_value = self.settings["extension_colors"].get(".md", "green")
+        html_color_radio = RadioList(color_choices); html_color_radio.current_value = self.settings["extension_colors"].get(".html", "green")
+        log_color_radio = RadioList(color_choices); log_color_radio.current_value = self.settings["extension_colors"].get(".log", "gray")
+        
+        dir_color_radio = RadioList(color_choices); dir_color_radio.current_value = self.settings["extension_colors"].get("directory", "green")
+        tar_color_radio = RadioList(color_choices); tar_color_radio.current_value = self.settings["extension_colors"].get(".tar", "red")
+        img_color_radio = RadioList(color_choices); img_color_radio.current_value = self.settings["extension_colors"].get(".jpg", "cyan")
 
-        sh_color_radio = RadioList(color_choices)
-        sh_color_radio.current_value = self.settings["extension_colors"].get(".sh", "magenta")
+        # Layout se 4 sloupci
+        col1 = HSplit([
+            Label(text="[ PROGR. 1 ]", style="class:header"),
+            Label(text=".py:"), py_color_radio,
+            Label(text=".sh:"), sh_color_radio,
+            Label(text=".js:"), js_color_radio,
+        ], padding=0)
 
-        txt_color_radio = RadioList(color_choices)
-        txt_color_radio.current_value = self.settings["extension_colors"].get(".txt", "white")
+        col2 = HSplit([
+            Label(text="[ PROGR. 2 ]", style="class:header"),
+            Label(text=".rs:"), rs_color_radio,
+            Label(text="C/C++:"), cpp_color_radio,
+            Label(text="SQL/DB:"), sql_color_radio,
+        ], padding=0)
 
-        md_color_radio = RadioList(color_choices)
-        md_color_radio.current_value = self.settings["extension_colors"].get(".md", "green")
+        col3 = HSplit([
+            Label(text="[ CONFIG/TXT ]", style="class:header"),
+            Label(text="JSON:"), json_color_radio,
+            Label(text="YAML:"), yaml_color_radio,
+            Label(text="TEXT:"), txt_color_radio,
+            Label(text="MD:"), md_color_radio,
+        ], padding=0)
 
-        dir_color_radio = RadioList(color_choices)
-        dir_color_radio.current_value = self.settings["extension_colors"].get("directory", "green")
+        col4 = HSplit([
+            Label(text="[ SYSTÉM/MÉDIA ]", style="class:header"),
+            Label(text="Složky:"), dir_color_radio,
+            Label(text="Archivy:"), tar_color_radio,
+            Label(text="Obrázky:"), img_color_radio,
+            Label(text="HTML/Log:"), html_color_radio,
+        ], padding=0)
+
+        dialog_body = VSplit([
+            col1, Window(width=1, char='│', style="class:line"),
+            col2, Window(width=1, char='│', style="class:line"),
+            col3, Window(width=1, char='│', style="class:line"),
+            col4,
+        ], padding=1)
 
         dialog = Dialog(
-            title="NASTAVENÍ",
-            body=HSplit([
-                Label(text="Náhled složek:"),
-                large_preview_radio,
-                Label(text="\nLog panel:"),
-                show_log_radio,
-                Label(text="\nMód příkazů ($$ a $):"),
-                cmd_mode_radio,
-                Label(text="\nBarvy - .py:"),
-                py_color_radio,
-                Label(text=".sh:"),
-                sh_color_radio,
-                Label(text=".txt:"),
-                txt_color_radio,
-                Label(text=".md:"),
-                md_color_radio,
-                Label(text="Složky:"),
-                dir_color_radio,
-            ]),
+            title="NASTAVENÍ BAREV (Tab přepíná sloupce)",
+            body=dialog_body,
             buttons=[
                 Button(text="Uložit", handler=apply_settings),
                 Button(text="Zrušit", handler=cancel),
@@ -765,7 +952,7 @@ class RenegadeFM_Ultimate:
 
         self.active_dialog = {"type": "settings"}
         self.root_container.floats.append(Float(content=dialog))
-        self.layout.focus(large_preview_radio)
+        self.layout.focus(py_color_radio)
         get_app().invalidate()
 
         return await future
@@ -773,7 +960,7 @@ class RenegadeFM_Ultimate:
     def setup_bindings(self):
         kb = self.kb
 
-        panel_focus = Condition(lambda: self.layout.has_focus(self.file_list_control))
+        panel_focus = Condition(lambda: self.layout.has_focus(self.file_list_control)) & Condition(lambda: self.active_dialog is None)
         allow_focus_toggle = Condition(lambda: self.active_dialog is None)
 
         @kb.add('f1', filter=panel_focus)
@@ -784,40 +971,108 @@ class RenegadeFM_Ultimate:
 
         @kb.add('tab', filter=allow_focus_toggle)
         def _(event):
+            if self.terminal_fullscreen:
+                return # V full-screenu tabulátor posíláme do terminálu
             if self.layout.has_focus(self.file_list_control):
                 self.layout.focus(self.search_input)
+            elif self.layout.has_focus(self.search_input):
+                if self.settings["show_log"]:
+                    self.layout.focus(self.terminal_control)
+                else:
+                    self.layout.focus(self.file_list_control)
             else:
                 self.layout.focus(self.file_list_control)
         
+        @kb.add('c-t', filter=allow_focus_toggle)
+        def _(event):
+            self.terminal_fullscreen = not self.terminal_fullscreen
+            if self.terminal_fullscreen:
+                self.layout.focus(self.terminal_control)
+            else:
+                self.layout.focus(self.file_list_control)
+            self._invalidate_ui()
+
         @kb.add('f2', filter=panel_focus)
         def _(event):
             asyncio.create_task(self.show_settings_dialog())
 
-        @kb.add('end')
+        not_in_terminal = (~has_focus(self.terminal_control)) & allow_focus_toggle
+
+        @kb.add('end', filter=not_in_terminal)
         def _(event):
             self._save_last_path()
             event.app.exit()
 
-        @kb.add('c-q')
+        @kb.add('c-q', filter=not_in_terminal)
         def _(event):
             self._save_last_path()
             self.log_to_terminal(f"\n[EXIT] Ukončení - poslední složka: {self.path}\n")
             event.app.exit()
 
-        @kb.add('c-c')
+        @kb.add('c-c', filter=not_in_terminal)
         def _(event):
             self._save_last_path()
             self.log_to_terminal(f"\n[EXIT] Ctrl+C - poslední složka: {self.path}\n")
             event.app.exit()
 
-        @kb.add('q')
+        @kb.add('q', filter=not_in_terminal)
         def _(event):
             if self.layout.has_focus(self.file_list_control):
                 self._save_last_path()
                 self.log_to_terminal(f"\n[EXIT] Konec - poslední složka: {self.path}\n")
                 event.app.exit()
 
-        in_file_list = Condition(lambda: self.layout.has_focus(self.file_list_control))
+        # TERMINAL BINDINGS
+        # Přidáváme podmínku allow_focus_toggle (žádný dialog), aby terminál nepolykal klávesy v dialozích
+        in_terminal = has_focus(self.terminal_control) & allow_focus_toggle
+
+        @kb.add('<any>', filter=in_terminal)
+        def _(event):
+            for char in event.data:
+                self.send_to_terminal(char)
+
+        @kb.add('tab', filter=in_terminal)
+        def _(event):
+            # Poslat skutečný TAB do terminálu
+            self.send_to_terminal('\t')
+
+        @kb.add('enter', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\r')
+
+        @kb.add('backspace', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x7f')
+        
+        @kb.add('c-c', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x03')
+
+        @kb.add('c-d', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x04')
+
+        @kb.add('c-l', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x0c')
+            
+        @kb.add('up', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x1b[A')
+
+        @kb.add('down', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x1b[B')
+
+        @kb.add('right', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x1b[C')
+
+        @kb.add('left', filter=in_terminal)
+        def _(event):
+            self.send_to_terminal('\x1b[D')
+
+        in_file_list = Condition(lambda: self.layout.has_focus(self.file_list_control)) & allow_focus_toggle
 
         @kb.add('up', filter=in_file_list)
         def _(event): 
@@ -829,7 +1084,7 @@ class RenegadeFM_Ultimate:
 
         @kb.add('pageup', filter=in_file_list)
         def _(event):
-            asyncio.create_task(self.action_create_alias())
+            self.toggle_selection('symlink')
 
         @kb.add('home', filter=in_file_list)
         def _(event):
@@ -857,6 +1112,10 @@ class RenegadeFM_Ultimate:
         @kb.add('v', filter=in_file_list)
         def _(event): 
             self.action_paste()
+
+        @kb.add('c-v', filter=in_file_list)
+        def _(event):
+            asyncio.create_task(self.action_paste_symlink_custom())
 
         @kb.add('c-r', filter=in_file_list)
         def _(event):
@@ -922,11 +1181,11 @@ class RenegadeFM_Ultimate:
 
         @kb.add('z', filter=in_file_list)
         def _(event):
-            self.toggle_zip_mark()
+            self.toggle_tar_mark()
 
         @kb.add('c-z', filter=in_file_list)
         def _(event):
-            asyncio.create_task(self.action_zip_marked())
+            asyncio.create_task(self.action_tar_marked())
 
     def toggle_delete_mark(self):
         if not self.files:
@@ -941,55 +1200,63 @@ class RenegadeFM_Ultimate:
             self.delete_marks.add(full_path)
         self._invalidate_ui()
 
-    def toggle_zip_mark(self):
+    def toggle_tar_mark(self):
         if not self.files:
             return
         filename = self.files[self.selected_index]
         if filename == "..":
             return
         full_path = os.path.join(self.path, filename)
-        if full_path in self.zip_marks:
-            self.zip_marks.remove(full_path)
+        if full_path in self.tar_marks:
+            self.tar_marks.remove(full_path)
         else:
-            self.zip_marks.add(full_path)
+            self.tar_marks.add(full_path)
         self._invalidate_ui()
 
-    async def action_zip_marked(self):
-        if not self.zip_marks:
+    async def action_tar_marked(self):
+        if not self.tar_marks:
             self.log_to_terminal("Žádné soubory k zabalení.\n")
             return
         
-        count_text = f"{len(self.zip_marks)} položky" if len(self.zip_marks) > 1 else "1 položku"
-        zip_name = await self._show_input_dialog(
-            title="Vytvořit ZIP",
-            label_text="Zadejte název souboru ZIP (bez .zip):",
+        # Výběr formátu komprese
+        choice = await self._show_radiolist_dialog(
+            title="Vytvořit Archiv",
+            text="Vyberte formát archivu:",
+            values=[
+                ("tar", "Jen TAR (bez komprese)"),
+                ("tar.gz", "TAR.GZ (Gzip komprese)"),
+                ("tar.bz2", "TAR.BZ2 (Bzip2 komprese)")
+            ]
+        )
+        
+        if not choice:
+            self.log_to_terminal("Vytváření archivu zrušeno.\n")
+            return
+
+        archive_name = await self._show_input_dialog(
+            title="Název archivu",
+            label_text=f"Zadejte název souboru (bez .{choice}):",
             default="archive"
         )
 
-        if not zip_name:
-            self.log_to_terminal("Vytváření ZIP zrušeno.\n")
+        if not archive_name:
+            self.log_to_terminal("Vytváření archivu zrušeno.\n")
             return
 
-        zip_path = os.path.join(self.path, f"{zip_name}.zip")
+        archive_path = os.path.join(self.path, f"{archive_name}.{choice}")
+        mode = "w:gz" if choice == "tar.gz" else ("w:bz2" if choice == "tar.bz2" else "w")
         
         try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for file_path in self.zip_marks:
-                    if os.path.isfile(file_path):
-                        arcname = os.path.basename(file_path)
-                        zf.write(file_path, arcname=arcname)
-                    elif os.path.isdir(file_path):
-                        for root, dirs, files in os.walk(file_path):
-                            for file in files:
-                                file_full_path = os.path.join(root, file)
-                                arcname = os.path.relpath(file_full_path, self.path)
-                                zf.write(file_full_path, arcname=arcname)
+            with tarfile.open(archive_path, mode) as tar:
+                for file_path in self.tar_marks:
+                    arcname = os.path.basename(file_path)
+                    tar.add(file_path, arcname=arcname)
             
-            self.zip_marks.clear()
+            self.tar_marks.clear()
             self.refresh_files()
-            self.log_to_terminal(f"ZIP archiv '{zip_name}.zip' vytvořen ({len(self.zip_marks)} položek).\n")
+            self.log_to_terminal(f"Archiv '{archive_name}.{choice}' vytvořen.\n")
         except Exception as e:
-            self.log_to_terminal(f"Chyba při vytváření ZIP: {e}\n")
+            self.log_to_terminal(f"Chyba při vytváření archivu: {e}\n")
 
 
     async def action_delete_marked(self):
@@ -1090,6 +1357,8 @@ class RenegadeFM_Ultimate:
                 dst = os.path.join(self.path, os.path.basename(src))
                 if action == 'move': 
                     shutil.move(src, dst)
+                elif action == 'symlink':
+                    os.symlink(src, dst)
                 else:
                     if os.path.isdir(src): 
                         shutil.copytree(src, dst)
@@ -1101,6 +1370,30 @@ class RenegadeFM_Ultimate:
         self.clipboard = []
         self.refresh_files()
         self.log_to_terminal(f"Hotovo ({action} {count}).\n")
+
+    async def action_paste_symlink_custom(self):
+        if not self.clipboard or self.clipboard_action != 'symlink':
+            self.log_to_terminal("Nic není označeno pro symlink.\n")
+            return
+        
+        src = self.clipboard[0] # Bereme první označený pro přejmenování
+        default_name = os.path.basename(src)
+        
+        new_name = await self._show_input_dialog(
+            title="Nový název symlinku",
+            label_text=f"Zadejte název symlinku pro '{default_name}':",
+            default=default_name
+        )
+        
+        if new_name:
+            dst = os.path.join(self.path, new_name)
+            try:
+                os.symlink(src, dst)
+                self.log_to_terminal(f"Symlink '{new_name}' vytvořen.\n")
+                self.clipboard = []
+                self.refresh_files()
+            except Exception as e:
+                self.log_to_terminal(f"Chyba symlinku: {e}\n")
 
     async def action_rename(self):
         f = self.files[self.selected_index]
@@ -1120,41 +1413,6 @@ class RenegadeFM_Ultimate:
                 self.log_to_terminal(f"Přejmenováno: {f} -> {new_name}\n")
             except Exception as e:
                 self.log_to_terminal(f"Chyba: {e}\n")
-
-    async def action_create_alias(self):
-        f = self.files[self.selected_index]
-        if f == "..": 
-            return
-        
-        full_path = os.path.join(self.path, f)
-        default_name = os.path.splitext(f)[0]
-        
-        alias_name = await self._show_input_dialog(
-            title="Vytvořit alias",
-            label_text=f"Zadejte název aliasu pro '{f}':",
-            default=default_name
-        )
-        
-        if alias_name:
-            if f.endswith('.py'): 
-                cmd = f"python3 '{full_path}'"
-            elif f.endswith('.sh'): 
-                cmd = f"bash '{full_path}'"
-            elif f.endswith('.js'): 
-                cmd = f"node '{full_path}'"
-            else: 
-                cmd = f"'{full_path}'"
-            
-            line = f"\nalias {alias_name}=\"{cmd}\"\n"
-            rc_path = os.path.expanduser("~/.bashrc")
-            
-            try:
-                with open(rc_path, "a") as rc:
-                    rc.write(line)
-                self.log_to_terminal(f"Alias '{alias_name}' přidán do .bashrc\n")
-                get_app().create_background_task(self.run_script_async(f"source {rc_path} && echo 'Konfigurace načtena'"))
-            except Exception as e:
-                self.log_to_terminal(f"Chyba zápisu aliasu: {e}\n")
 
     async def supermod_copy_to_home(self):
         if not self.files:
@@ -1193,6 +1451,10 @@ class RenegadeFM_Ultimate:
 
 if __name__ == "__main__":
     try:
+        # Explicitní vytvoření a nastavení loopu pro eliminaci DeprecationWarning
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         fm = RenegadeFM_Ultimate()
         fm.app.run()
     except Exception as e:
