@@ -19,7 +19,7 @@ fi
 
 # 2. Instalace závislostí
 echo "[1/3] Instaluji závislosti..."
-"$PIP_BIN" install --upgrade prompt_toolkit
+"$PIP_BIN" install --upgrade prompt_toolkit --break-system-packages
 
 # 3. Vytvoření spouštěče rfm
 echo "[2/3] Vytvářím spouštěč 'rfm'..."
